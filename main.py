@@ -58,18 +58,20 @@ async def solve_quiz(start_url: str):
                 print("👀 Page content extracted. Consulting LLM...")
 
                 # 3. Ask LLM to solve it
-                # We ask the LLM to identify if it needs to scrape another URL
-                # FIX: Explicitly mentioned "JSON" to satisfy Azure/OpenAI requirements
+                # FIX: Added strict instructions to prevent nested JSON objects as answers
                 system_prompt = """
                 You are an expert data extraction agent.
                 1. Analyze the HTML and screenshot.
                 2. If the user asks to "scrape" or "download" a DIFFERENT link to get the answer, return valid JSON:
                    {"action": "scrape", "scrape_url": "<url_to_scrape>"}
                 3. If you have the answer, return valid JSON:
-                   {"action": "submit", "answer": <value>, "submit_url": "<url_found>"}
+                   {"action": "submit", "answer": <extracted_value_only>, "submit_url": "<url_found>"}
                 4. Look inside HTML tags/scripts for hidden secrets.
                 5. Do NOT output the instruction text as the answer.
-                6. Your output must be a valid JSON object.
+                6. The "answer" field must be a SINGLE value (string or number). 
+                   Do NOT return a dictionary/JSON object as the "answer". 
+                   If the page shows a JSON example, extract ONLY the value requested (e.g., the 'cutoff' or 'sum').
+                7. Your output must be a valid JSON object.
                 """
                 
                 response = await client.chat.completions.create(
@@ -93,7 +95,7 @@ async def solve_quiz(start_url: str):
                     target_url = urljoin(current_url, raw_scrape_url)
                     print(f"🔎 Agent requested scraping: {target_url}")
                     
-                    # Open a new tab so we don't lose the main page context (submit URL)
+                    # Open a new tab
                     page2 = await context.new_page()
                     await page2.goto(target_url, timeout=30000)
                     await page2.wait_for_load_state("networkidle")
@@ -102,7 +104,6 @@ async def solve_quiz(start_url: str):
                     
                     print("✅ Scraped data retrieved. Asking LLM again...")
                     
-                    # Ask LLM again with the new data
                     follow_up_response = await client.chat.completions.create(
                         model="openai/gpt-4o-mini",
                         messages=[
@@ -118,6 +119,17 @@ async def solve_quiz(start_url: str):
                 answer = llm_output.get("answer")
                 raw_submit_url = llm_output.get("submit_url")
                 
+                # --- SAFETY FIX: Unwrap accidentally nested dictionaries ---
+                if isinstance(answer, dict):
+                    print(f"⚠️ Warning: LLM returned a dict as answer. Attempting to extract value...")
+                    # Try to find a key that is NOT standard metadata
+                    candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url']]
+                    if candidates:
+                        answer = candidates[0] # Pick the first unique value
+                        print(f"🔧 Fixed Answer: {answer}")
+                    else:
+                        answer = json.dumps(answer) # Fallback to string
+
                 if not answer or not raw_submit_url:
                     print("❌ Failed to find answer or submit URL")
                     break
