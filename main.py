@@ -12,8 +12,8 @@ app = FastAPI()
 
 # --- CONFIGURATION: AI PIPE ---
 client = AsyncOpenAI(
-    api_key=os.environ.get("eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIxZjIwMDA1MTZAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.DwcuH6eWwRhp8nUMrW7ogzfC-5bLn-4Ux52hldjri0E"),
-    base_url="https://aipipe.org/openrouter/v1" # <--- AI Pipe Proxy URL
+    api_key=os.environ.get("AIPIPE_TOKEN"), 
+    base_url="https://aipipe.org/openrouter/v1"
 )
 
 STUDENT_EMAIL = os.environ.get("STUDENT_EMAIL")
@@ -116,4 +116,5 @@ async def start(req: QuizRequest, tasks: BackgroundTasks):
 
 @app.get("/")
 async def health():
+
     return {"status": "ok"}
