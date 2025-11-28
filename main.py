@@ -152,17 +152,19 @@ async def solve_quiz(start_url: str):
                 print("👀 Context acquired. Planning action...")
 
                 # --- 3. PLAN ACTION (LLM) ---
+                # FIX: Explicitly instructing "JSON" output to satisfy Azure constraints
                 system_prompt = """
                 You are an autonomous data extraction agent.
                 1. Analyze the HTML, Screenshot, and Audio Transcript.
-                2. If you need to download a file or access an API to get the answer, return:
+                2. If you need to download a file or access an API to get the answer, return valid JSON:
                    {"action": "scrape", "scrape_url": "<url>", "headers": {"key": "val"}, "submit_url": "<url>"}
-                3. If instructions specify a MATH FILTER (e.g. "sum numbers < 5000"), extract it:
+                3. If instructions specify a MATH FILTER (e.g. "sum numbers < 5000"), extract it in JSON:
                    {"action": "scrape", "scrape_url": "<file_url>", "submit_url": "<url>", "math_filter": {"cutoff": 12000, "direction": "<"}}
                 4. If the answer is a CHART or IMAGE, generate SVG code for it.
-                5. If you have the answer, return:
+                5. If you have the answer, return valid JSON:
                    {"action": "submit", "answer": <value>, "submit_url": "<url>"}
                 6. Default "submit_url" to "/submit".
+                7. Your output must be a valid JSON object.
                 """
                 
                 response = await client.chat.completions.create(
@@ -237,7 +239,7 @@ async def solve_quiz(start_url: str):
                             follow_up = await client.chat.completions.create(
                                 model="openai/gpt-4o-mini",
                                 messages=[
-                                    {"role": "system", "content": "Analyze data. Return JSON: {\"answer\": <value>}"},
+                                    {"role": "system", "content": "Analyze data. Return valid JSON: {\"answer\": <value>}"},
                                     {"role": "user", "content": f"Context:\n{html_content}\n\nFile Data:\n{truncated_data}"}
                                 ],
                                 response_format={"type": "json_object"}
@@ -259,7 +261,7 @@ async def solve_quiz(start_url: str):
                         follow_up = await client.chat.completions.create(
                             model="openai/gpt-4o-mini",
                             messages=[
-                                {"role": "system", "content": "Analyze the page. Return JSON: {\"answer\": <value>}"},
+                                {"role": "system", "content": "Analyze the page. Return valid JSON: {\"answer\": <value>}"},
                                 {"role": "user", "content": f"Main Page HTML: {html_content}\n\nScraped Page HTML:\n{scraped_html}"}
                             ],
                             response_format={"type": "json_object"}
