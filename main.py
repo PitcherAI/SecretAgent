@@ -3,8 +3,8 @@ import json
 import asyncio
 import base64
 import httpx
-from urllib.parse import urljoin
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from urllib.parse import urljoin, urlparse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
@@ -26,6 +26,23 @@ class QuizRequest(BaseModel):
     email: str
     secret: str
     url: str
+
+# ------------------------------------------------------------------
+# HELPER: FETCH EXTERNAL DATA (CSV/JSON/TEXT)
+# ------------------------------------------------------------------
+async def fetch_external_content(url):
+    """
+    Uses Python requests (httpx) to grab data from a URL.
+    Better than a browser for CSVs or raw text files.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=20)
+            resp.raise_for_status()
+            # Return text (limit to 100k chars to save tokens)
+            return resp.text[:100000] 
+    except Exception as e:
+        return f"Error fetching content: {str(e)}"
 
 # ------------------------------------------------------------------
 # CORE AGENT LOGIC
@@ -58,20 +75,19 @@ async def solve_quiz(start_url: str):
                 print("👀 Page content extracted. Consulting LLM...")
 
                 # 3. Ask LLM to solve it
-                # FIX: Added strict instructions to prevent nested JSON objects as answers
+                # FIX: Improved instructions for CSVs and Audio links
                 system_prompt = """
                 You are an expert data extraction agent.
                 1. Analyze the HTML and screenshot.
-                2. If the user asks to "scrape" or "download" a DIFFERENT link to get the answer, return valid JSON:
+                2. If the answer requires data from a DIFFERENT link (like a CSV, JSON, or text file linked in the page), return valid JSON:
                    {"action": "scrape", "scrape_url": "<url_to_scrape>"}
-                3. If you have the answer, return valid JSON:
+                3. If you have the final answer, return valid JSON:
                    {"action": "submit", "answer": <extracted_value_only>, "submit_url": "<url_found>"}
-                4. Look inside HTML tags/scripts for hidden secrets.
+                4. AUDIO/FILES: If there is an audio file, look for a text link nearby (like "Download Data" or a .csv link) and request to SCRAPE that URL.
                 5. Do NOT output the instruction text as the answer.
                 6. The "answer" field must be a SINGLE value (string or number). 
-                   Do NOT return a dictionary/JSON object as the "answer". 
-                   If the page shows a JSON example, extract ONLY the value requested (e.g., the 'cutoff' or 'sum').
-                7. Your output must be a valid JSON object.
+                7. For "submit_url", if explicitly mentioned use it. If vague, default to "/submit".
+                8. Your output must be a valid JSON object.
                 """
                 
                 response = await client.chat.completions.create(
@@ -89,26 +105,23 @@ async def solve_quiz(start_url: str):
                 llm_output = json.loads(response.choices[0].message.content)
                 print(f"🤖 LLM Action: {llm_output}")
 
-                # --- HANDLE SCRAPING REQUESTS ---
+                # --- HANDLE SCRAPING REQUESTS (CSV/External Data) ---
                 if llm_output.get("action") == "scrape":
                     raw_scrape_url = llm_output.get("scrape_url")
                     target_url = urljoin(current_url, raw_scrape_url)
                     print(f"🔎 Agent requested scraping: {target_url}")
                     
-                    # Open a new tab
-                    page2 = await context.new_page()
-                    await page2.goto(target_url, timeout=30000)
-                    await page2.wait_for_load_state("networkidle")
-                    scraped_content = await page2.content()
-                    await page2.close()
+                    # FIX: Use httpx to fetch CSV/Text directly (Browser is bad for downloads)
+                    scraped_data = await fetch_external_content(target_url)
                     
-                    print("✅ Scraped data retrieved. Asking LLM again...")
+                    print("✅ Scraped data retrieved (First 500 chars):", scraped_data[:500])
+                    print("Asking LLM to analyze scraped data...")
                     
                     follow_up_response = await client.chat.completions.create(
                         model="openai/gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Extract the answer from the scraped content below. Return valid JSON: {\"answer\": <value>, \"submit_url\": <from_previous_step>}"},
-                            {"role": "user", "content": f"Original Page HTML: {html_content}\n\nScraped External Content: {scraped_content}"}
+                            {"role": "system", "content": "Analyze the scraped file content below. Solve the user's question (e.g., sum a column, find a code). Return valid JSON: {\"answer\": <value>, \"submit_url\": <from_previous_step>}"},
+                            {"role": "user", "content": f"Original Page HTML: {html_content}\n\nScraped File Content:\n{scraped_data}"}
                         ],
                         response_format={"type": "json_object"}
                     )
@@ -119,22 +132,25 @@ async def solve_quiz(start_url: str):
                 answer = llm_output.get("answer")
                 raw_submit_url = llm_output.get("submit_url")
                 
-                # --- SAFETY FIX: Unwrap accidentally nested dictionaries ---
+                # Unwrap accidentally nested dictionaries
                 if isinstance(answer, dict):
-                    print(f"⚠️ Warning: LLM returned a dict as answer. Attempting to extract value...")
-                    # Try to find a key that is NOT standard metadata
                     candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url']]
                     if candidates:
-                        answer = candidates[0] # Pick the first unique value
-                        print(f"🔧 Fixed Answer: {answer}")
+                        answer = candidates[0]
                     else:
-                        answer = json.dumps(answer) # Fallback to string
+                        answer = json.dumps(answer)
 
                 if not answer or not raw_submit_url:
                     print("❌ Failed to find answer or submit URL")
                     break
 
-                submit_url = urljoin(current_url, raw_submit_url)
+                # --- URL FIX: Prevent submitting to root domain ---
+                parsed_url = urlparse(raw_submit_url)
+                if not parsed_url.path or parsed_url.path == "/":
+                    print(f"⚠️ Warning: LLM suggested root URL '{raw_submit_url}'. Defaulting to '/submit'.")
+                    submit_url = urljoin(current_url, "/submit")
+                else:
+                    submit_url = urljoin(current_url, raw_submit_url)
 
                 payload = {
                     "email": STUDENT_EMAIL,
@@ -147,14 +163,20 @@ async def solve_quiz(start_url: str):
                 
                 async with httpx.AsyncClient() as http:
                     resp = await http.post(submit_url, json=payload, timeout=30)
-                    resp_data = resp.json()
+                    
+                    try:
+                        resp_data = resp.json()
+                    except json.JSONDecodeError:
+                        print(f"🔥 Error: Server returned non-JSON response (Status: {resp.status_code})")
+                        print(f"Response Text: {resp.text[:200]}...") 
+                        break
                     
                 print(f"✅ Result: {resp_data}")
                 
                 if resp_data.get("correct"):
                     current_url = resp_data.get("url")
                 else:
-                    print("⛔ Answer incorrect.")
+                    print(f"⛔ Answer incorrect. Reason: {resp_data.get('reason')}")
                     break
                     
             except Exception as e:
