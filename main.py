@@ -4,7 +4,7 @@ import asyncio
 import base64
 import httpx
 from urllib.parse import urljoin, urlparse
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
@@ -75,7 +75,6 @@ async def solve_quiz(start_url: str):
                 print("👀 Page content extracted. Consulting LLM...")
 
                 # 3. Ask LLM to solve it
-                # FIX: Improved instructions for CSVs and Audio links
                 system_prompt = """
                 You are an expert data extraction agent.
                 1. Analyze the HTML and screenshot.
@@ -105,23 +104,35 @@ async def solve_quiz(start_url: str):
                 llm_output = json.loads(response.choices[0].message.content)
                 print(f"🤖 LLM Action: {llm_output}")
 
-                # --- HANDLE SCRAPING REQUESTS (CSV/External Data) ---
+                # --- HANDLE SCRAPING REQUESTS ---
                 if llm_output.get("action") == "scrape":
                     raw_scrape_url = llm_output.get("scrape_url")
                     target_url = urljoin(current_url, raw_scrape_url)
                     print(f"🔎 Agent requested scraping: {target_url}")
                     
-                    # FIX: Use httpx to fetch CSV/Text directly (Browser is bad for downloads)
-                    scraped_data = await fetch_external_content(target_url)
+                    # SMART SCRAPING SWITCHER
+                    # If it's a file (CSV/TXT), use HTTPX (faster, no download dialogs)
+                    # If it's a Webpage, use Playwright (renders JS)
+                    path = urlparse(target_url).path
+                    if path.endswith(('.csv', '.txt', '.json', '.xml')):
+                        print("📂 Detected file download. Using HTTPX.")
+                        scraped_data = await fetch_external_content(target_url)
+                    else:
+                        print("🌐 Detected webpage. Using Playwright.")
+                        page2 = await context.new_page()
+                        await page2.goto(target_url, timeout=30000)
+                        await page2.wait_for_load_state("networkidle")
+                        scraped_data = await page2.content()
+                        await page2.close()
                     
-                    print("✅ Scraped data retrieved (First 500 chars):", scraped_data[:500])
+                    print(f"✅ Scraped data retrieved (First 500 chars): {scraped_data[:500]}")
                     print("Asking LLM to analyze scraped data...")
                     
                     follow_up_response = await client.chat.completions.create(
                         model="openai/gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Analyze the scraped file content below. Solve the user's question (e.g., sum a column, find a code). Return valid JSON: {\"answer\": <value>, \"submit_url\": <from_previous_step>}"},
-                            {"role": "user", "content": f"Original Page HTML: {html_content}\n\nScraped File Content:\n{scraped_data}"}
+                            {"role": "system", "content": "Analyze the scraped content below. Solve the user's question (e.g., sum a column, find a code). Return valid JSON: {\"answer\": <value>, \"submit_url\": <from_previous_step>}"},
+                            {"role": "user", "content": f"Original Page HTML: {html_content}\n\nScraped Content:\n{scraped_data}"}
                         ],
                         response_format={"type": "json_object"}
                     )
