@@ -3,8 +3,9 @@ import json
 import asyncio
 import base64
 import httpx
+import re
 from urllib.parse import urljoin, urlparse
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
@@ -30,46 +31,97 @@ class QuizRequest(BaseModel):
 # ------------------------------------------------------------------
 # HELPER: FETCH EXTERNAL DATA
 # ------------------------------------------------------------------
-async def fetch_external_content(url):
+async def fetch_external_content(url, is_binary=False):
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=20)
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.get(url, timeout=30)
             resp.raise_for_status()
-            return resp.text
+            if is_binary:
+                return resp.content # Bytes for Audio/Images
+            return resp.text # String for CSV/Text
     except Exception as e:
-        return f"Error fetching content: {str(e)}"
+        print(f"Fetch Error ({url}): {e}")
+        return None
 
 # ------------------------------------------------------------------
-# HELPER: LOCAL STATS
+# HELPER: AUDIO TRANSCRIPTION
 # ------------------------------------------------------------------
-def analyze_data_locally(content):
+async def transcribe_audio(audio_bytes, filename="audio.mp3"):
     """
-    Calculates basic stats for numeric data.
+    Sends audio to Whisper via AI Pipe to get the instructions.
+    """
+    print(f"🎤 Transcribing audio ({len(audio_bytes)} bytes)...")
+    try:
+        # Create a mock file-like object with a name (required by OpenAI API)
+        import io
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = filename
+
+        # AI Pipe supports OpenAI's audio endpoints
+        # We use a separate call or model if needed, but 'openai/whisper-1' is standard
+        # Note: We might need to temporarily switch base_url if AI Pipe routes audio differently,
+        # but usually it proxies standard endpoints.
+        
+        # NOTE: For some proxies, we might need to use the standard OpenAI URL with the pipe key.
+        # But let's try the configured client first.
+        transcription = await client.audio.transcriptions.create(
+            model="openai/whisper-1", 
+            file=audio_file
+        )
+        print(f"🗣️ Transcript: {transcription.text}")
+        return transcription.text
+    except Exception as e:
+        print(f"⚠️ Transcription Failed: {e}")
+        return "[Audio Transcription Failed]"
+
+# ------------------------------------------------------------------
+# HELPER: MATH ENGINE
+# ------------------------------------------------------------------
+def perform_filtered_math(content, cutoff_val, direction):
+    """
+    Executes math logic extracted from the Audio/Text.
     """
     try:
-        # Clean data
+        # Clean and parse numbers
         lines = [l.strip().replace(',', '') for l in content.split('\n') if l.strip()]
         numbers = []
         for line in lines:
-            if line.replace('.', '', 1).lstrip('-').isdigit():
+            # Robust number parsing
+            if re.match(r'^-?\d+(\.\d+)?$', line):
                 numbers.append(float(line))
         
-        # If dataset is numeric, return useful stats
-        if len(numbers) > 0 and len(numbers) > len(lines) * 0.5:
-            stats = {
-                "sum": int(sum(numbers)),
-                "count": len(numbers),
-                "max": max(numbers),
-                "min": min(numbers),
-                "average": sum(numbers) / len(numbers)
-            }
-            print(f"🧮 Local Stats Calculated: {stats}")
-            return json.dumps(stats)
-            
+        if not numbers:
+            return None
+
+        print(f"🧮 Math Engine: Processing {len(numbers)} numbers. Filter: {direction} {cutoff_val}")
+
+        filtered = []
+        cutoff = float(cutoff_val)
+
+        # Logic Map
+        if direction in ["<", "below", "less", "smaller"]:
+            filtered = [n for n in numbers if n < cutoff]
+        elif direction in [">", "above", "more", "greater", "larger"]:
+            filtered = [n for n in numbers if n > cutoff]
+        elif direction in ["=", "equal", "=="]:
+            filtered = [n for n in numbers if n == cutoff]
+        elif direction in ["!=", "not", "different"]:
+            filtered = [n for n in numbers if n != cutoff]
+        # Modulo logic (e.g. "divisible by 7")
+        elif direction in ["%", "divisible", "mod"]:
+            filtered = [n for n in numbers if n % cutoff == 0]
+        else:
+            # Fallback: Return Total Sum if direction is unclear
+            print("⚠️ Unknown direction, returning total sum.")
+            return int(sum(numbers))
+
+        result = int(sum(filtered))
+        print(f"✅ Calculation Result: {result}")
+        return result
+
     except Exception as e:
-        print(f"Math check failed: {e}")
-    
-    return "No numeric stats available."
+        print(f"Math Error: {e}")
+        return None
 
 # ------------------------------------------------------------------
 # CORE AGENT LOGIC
@@ -98,19 +150,34 @@ async def solve_quiz(start_url: str):
                 screenshot = await page.screenshot(type="png")
                 b64_img = base64.b64encode(screenshot).decode('utf-8')
                 
+                # --- AUDIO DETECTION ---
+                # Check for audio files in the HTML
+                audio_transcript = ""
+                audio_element = await page.query_selector("audio source, a[href$='.mp3'], a[href$='.wav']")
+                if audio_element:
+                    src = await audio_element.get_attribute("src") or await audio_element.get_attribute("href")
+                    if src:
+                        audio_url = urljoin(current_url, src)
+                        print(f"🎵 Found Audio: {audio_url}")
+                        audio_bytes = await fetch_external_content(audio_url, is_binary=True)
+                        if audio_bytes:
+                            audio_transcript = await transcribe_audio(audio_bytes)
+
                 print("👀 Page content extracted. Consulting LLM...")
 
                 # 3. Ask LLM (Step 1: Identify Action)
                 system_prompt = """
                 You are an expert data extraction agent.
-                1. Analyze the HTML and screenshot.
-                2. If the answer requires data from a link (CSV, JSON, TXT), return valid JSON:
-                   {"action": "scrape", "scrape_url": "<url_to_scrape>", "submit_url": "<url_to_submit_answer>"}
-                3. If you have the answer directly, return valid JSON:
+                1. Analyze the HTML, Screenshot, and Audio Transcript (if any).
+                2. If the answer requires downloading a file (CSV/JSON/TXT), return valid JSON:
+                   {"action": "scrape", "scrape_url": "<url_to_scrape>", "submit_url": "<url_to_submit>"}
+                3. If the instructions specify a MATH FILTER (e.g. "sum numbers < 5000", "cutoff 12000"), extract it:
+                   {"action": "scrape", "scrape_url": "<file_url>", "submit_url": "<submit_url>", "math_filter": {"cutoff": 12000, "direction": "<"}}
+                   Directions: "<", ">", "=", "divisible"
+                4. If you have the answer directly, return:
                    {"action": "submit", "answer": <value>, "submit_url": "<url_found>"}
-                4. AUDIO/FILES: If there is an audio file, look for a text link nearby (like "Download Data" or a .csv link) and scrape THAT.
-                5. Do NOT output the instruction text as the answer.
-                6. For "submit_url", default to "/submit" if not found.
+                5. AUDIO PRIORITY: The Audio Transcript often contains the filtering rule (e.g. "The cutoff is..."). Trust it.
+                6. Default "submit_url" to "/submit".
                 """
                 
                 response = await client.chat.completions.create(
@@ -118,7 +185,7 @@ async def solve_quiz(start_url: str):
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": [
-                            {"type": "text", "text": f"HTML Content:\n{html_content}"},
+                            {"type": "text", "text": f"HTML Content:\n{html_content}\n\nAudio Transcript:\n{audio_transcript}"},
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                         ]}
                     ],
@@ -128,7 +195,7 @@ async def solve_quiz(start_url: str):
                 llm_output = json.loads(response.choices[0].message.content)
                 print(f"🤖 LLM Action: {llm_output}")
 
-                # --- HANDLE SCRAPING ---
+                # --- HANDLE ACTIONS ---
                 answer = None
                 raw_submit_url = llm_output.get("submit_url")
 
@@ -137,49 +204,45 @@ async def solve_quiz(start_url: str):
                     target_url = urljoin(current_url, raw_scrape_url)
                     print(f"🔎 Agent requested scraping: {target_url}")
                     
-                    # 1. Download Data
                     path = urlparse(target_url).path
                     if path.endswith(('.csv', '.txt', '.json', '.xml')):
                         print("📂 Detected file. Using HTTPX.")
                         scraped_data = await fetch_external_content(target_url)
-                        stats_info = analyze_data_locally(scraped_data)
+                        
+                        # Check Math
+                        math_req = llm_output.get("math_filter")
+                        if math_req and scraped_data:
+                            cutoff = math_req.get("cutoff")
+                            direction = math_req.get("direction")
+                            answer = perform_filtered_math(scraped_data, cutoff, direction)
+                        
+                        # Fallback to LLM
+                        if answer is None and scraped_data:
+                            print("Asking LLM to analyze file content...")
+                            truncated_data = scraped_data[:50000]
+                            follow_up = await client.chat.completions.create(
+                                model="openai/gpt-4o-mini",
+                                messages=[
+                                    {"role": "system", "content": "Analyze the file. Solve the question. Return JSON: {\"answer\": <value>}"},
+                                    {"role": "user", "content": f"Context HTML: {html_content}\nAudio Transcript: {audio_transcript}\nFile Content:\n{truncated_data}"}
+                                ],
+                                response_format={"type": "json_object"}
+                            )
+                            final_data = json.loads(follow_up.choices[0].message.content)
+                            answer = final_data.get("answer")
                     else:
+                        # Webpage fallback
                         print("🌐 Detected webpage. Using Playwright.")
                         page2 = await context.new_page()
                         await page2.goto(target_url, timeout=30000)
-                        await page2.wait_for_load_state("networkidle")
                         scraped_data = await page2.content()
                         await page2.close()
-                        stats_info = "No stats."
-
-                    # 2. Ask LLM to Analyze (With larger context & filtering support)
-                    print("Asking LLM to analyze...")
-                    
-                    # FIX: Increased limit to 50k to ensure full CSV (1000 lines) fits
-                    truncated_data = scraped_data[:50000] 
-                    
-                    follow_up = await client.chat.completions.create(
-                        model="openai/gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": """
-                             Analyze the file content and the 'Local Stats'.
-                             1. Check the HTML instructions for constraints (e.g. "Cutoff", "Max", "Filter").
-                             2. If there are constraints (like "Sum numbers < 12000"), you MUST calculate the answer yourself using the provided file content. DO NOT use the Local Stats in this case.
-                             3. If there are NO constraints, you may use the 'Local Stats' sum/max/min.
-                             Return valid JSON: {"answer": <value>}
-                             """},
-                            {"role": "user", "content": f"Local Stats: {stats_info}\n\nOriginal Page HTML: {html_content}\n\nFile Content (Truncated):\n{truncated_data}"}
-                        ],
-                        response_format={"type": "json_object"}
-                    )
-                    final_data = json.loads(follow_up.choices[0].message.content)
-                    answer = final_data.get("answer")
                 
                 else:
                     answer = llm_output.get("answer")
 
                 # --- SUBMISSION ---
-                if not answer or not raw_submit_url:
+                if answer is None or not raw_submit_url:
                     print("❌ Missing answer or submit URL. Retrying loop...")
                     break
 
