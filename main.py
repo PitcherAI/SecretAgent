@@ -4,7 +4,7 @@ import asyncio
 import base64
 import httpx
 from urllib.parse import urljoin, urlparse
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
@@ -40,12 +40,11 @@ async def fetch_external_content(url):
         return f"Error fetching content: {str(e)}"
 
 # ------------------------------------------------------------------
-# HELPER: LOCAL STATS (Robust Fix for Sum/Max/Min/Avg)
+# HELPER: LOCAL STATS
 # ------------------------------------------------------------------
 def analyze_data_locally(content):
     """
     Calculates basic stats for numeric data.
-    Returns a text summary to help the LLM.
     """
     try:
         # Clean data
@@ -58,7 +57,7 @@ def analyze_data_locally(content):
         # If dataset is numeric, return useful stats
         if len(numbers) > 0 and len(numbers) > len(lines) * 0.5:
             stats = {
-                "sum": int(sum(numbers)), # Int is safer for this quiz
+                "sum": int(sum(numbers)),
                 "count": len(numbers),
                 "max": max(numbers),
                 "min": min(numbers),
@@ -139,12 +138,10 @@ async def solve_quiz(start_url: str):
                     print(f"🔎 Agent requested scraping: {target_url}")
                     
                     # 1. Download Data
-                    # Handle Files vs Webpages
                     path = urlparse(target_url).path
                     if path.endswith(('.csv', '.txt', '.json', '.xml')):
                         print("📂 Detected file. Using HTTPX.")
                         scraped_data = await fetch_external_content(target_url)
-                        # Calculate Stats (Sum/Max/Etc) Locally
                         stats_info = analyze_data_locally(scraped_data)
                     else:
                         print("🌐 Detected webpage. Using Playwright.")
@@ -155,20 +152,23 @@ async def solve_quiz(start_url: str):
                         await page2.close()
                         stats_info = "No stats."
 
-                    # 2. Ask LLM to Analyze with Stats Support
-                    print("Asking LLM to analyze (with local stats)...")
-                    truncated_data = scraped_data[:6000] # Fit in context
+                    # 2. Ask LLM to Analyze (With larger context & filtering support)
+                    print("Asking LLM to analyze...")
+                    
+                    # FIX: Increased limit to 50k to ensure full CSV (1000 lines) fits
+                    truncated_data = scraped_data[:50000] 
                     
                     follow_up = await client.chat.completions.create(
                         model="openai/gpt-4o-mini",
                         messages=[
                             {"role": "system", "content": """
-                             Analyze the file content and the 'Local Stats' provided.
-                             Solve the user's question (e.g., 'sum', 'max', 'count').
-                             If the question asks for a calculation (sum/max/etc), PREFER the values in 'Local Stats' as they are exact.
+                             Analyze the file content and the 'Local Stats'.
+                             1. Check the HTML instructions for constraints (e.g. "Cutoff", "Max", "Filter").
+                             2. If there are constraints (like "Sum numbers < 12000"), you MUST calculate the answer yourself using the provided file content. DO NOT use the Local Stats in this case.
+                             3. If there are NO constraints, you may use the 'Local Stats' sum/max/min.
                              Return valid JSON: {"answer": <value>}
                              """},
-                            {"role": "user", "content": f"Local Stats (Calculated by Python): {stats_info}\n\nOriginal Page HTML: {html_content}\n\nFile Content (Truncated):\n{truncated_data}"}
+                            {"role": "user", "content": f"Local Stats: {stats_info}\n\nOriginal Page HTML: {html_content}\n\nFile Content (Truncated):\n{truncated_data}"}
                         ],
                         response_format={"type": "json_object"}
                     )
@@ -176,7 +176,6 @@ async def solve_quiz(start_url: str):
                     answer = final_data.get("answer")
                 
                 else:
-                    # Direct answer found on page
                     answer = llm_output.get("answer")
 
                 # --- SUBMISSION ---
