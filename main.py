@@ -56,23 +56,26 @@ async def solve_quiz(start_url: str):
                 await page.goto(current_url, timeout=45000)
                 await page.wait_for_load_state("networkidle")
                 
-                # 2. Extract Data (Text + Screenshot)
-                # We take a screenshot because some questions might be visual (charts/tables)
-                body_text = await page.inner_text("body")
+                # 2. Extract Data (Full HTML + Screenshot)
+                # FIX: We use page.content() to get raw HTML (tags, attributes, scripts)
+                # instead of page.inner_text() which misses hidden data like <div id="secret">
+                html_content = await page.content() 
                 screenshot = await page.screenshot(type="png")
                 b64_img = base64.b64encode(screenshot).decode('utf-8')
                 
-                print("👀 Page content extracted. Consulting LLM...")
+                print("👀 Page content extracted (HTML + Screenshot). Consulting LLM...")
 
                 # 3. Ask LLM to solve it
                 # We explicitly ask for JSON to make parsing reliable
                 system_prompt = """
-                You are an autonomous data extraction agent.
-                1. Analyze the provided web page text and screenshot.
-                2. Identify the QUESTION asking for an answer.
-                3. Solve the question.
-                4. Identify the SUBMISSION URL (it might be relative like '/submit').
-                5. Return a strict JSON object: {"answer": <the_calculated_answer>, "submit_url": "<url_found>"}
+                You are an expert data extraction agent.
+                1. Analyze the provided HTML and screenshot.
+                2. If the user asks for a specific value (like a "sum", "code", or "secret"), extract the ACTUAL value.
+                3. Do NOT simply repeat the instruction text. 
+                   (Example: If asked for a secret, return "X83-99", NOT "the secret code").
+                4. Look inside HTML tags (like <span id="secret">, <script>, or data-attributes) if the answer is hidden.
+                5. Identify the SUBMISSION URL (it might be relative like '/submit').
+                6. Return strict JSON: {"answer": <value>, "submit_url": "<url_found>"}
                 """
                 
                 response = await client.chat.completions.create(
@@ -80,7 +83,7 @@ async def solve_quiz(start_url: str):
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": [
-                            {"type": "text", "text": f"Context Text:\n{body_text}"},
+                            {"type": "text", "text": f"HTML Content:\n{html_content}"},
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                         ]}
                     ],
