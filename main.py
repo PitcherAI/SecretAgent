@@ -4,7 +4,7 @@ import asyncio
 import base64
 import httpx
 import re
-import mimetypes
+import io
 from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -30,13 +30,10 @@ class QuizRequest(BaseModel):
     url: str
 
 # ------------------------------------------------------------------
-# HELPER: FETCH EXTERNAL DATA (Text, Binary, or API)
+# HELPER: FETCH EXTERNAL DATA
 # ------------------------------------------------------------------
 async def fetch_external_content(url, headers=None, is_binary=False):
-    """
-    Robust fetcher that handles API headers and binary files.
-    """
-    print(f"📥 Fetching: {url} (Binary: {is_binary}, Headers: {headers})")
+    print(f"📥 Fetching: {url}")
     try:
         async with httpx.AsyncClient() as http_client:
             resp = await http_client.get(url, headers=headers, timeout=30, follow_redirects=True)
@@ -54,7 +51,6 @@ async def fetch_external_content(url, headers=None, is_binary=False):
 async def transcribe_audio(audio_bytes, filename="audio.mp3"):
     print(f"🎤 Transcribing audio ({len(audio_bytes)} bytes)...")
     try:
-        import io
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = filename
         transcription = await client.audio.transcriptions.create(
@@ -65,17 +61,17 @@ async def transcribe_audio(audio_bytes, filename="audio.mp3"):
         return transcription.text
     except Exception as e:
         print(f"⚠️ Transcription Failed: {e}")
-        return "[Audio Transcription Failed]"
+        return ""
 
 # ------------------------------------------------------------------
-# HELPER: MATH ENGINE (Safe Local Calculation)
+# HELPER: MATH ENGINE
 # ------------------------------------------------------------------
 def perform_filtered_math(content, cutoff_val, direction):
     """
     Python handles the heavy lifting for arithmetic filters.
     """
     try:
-        # Extract numbers from text/csv content
+        # Extract numbers
         lines = [l.strip().replace(',', '') for l in content.split('\n') if l.strip()]
         numbers = []
         for line in lines:
@@ -89,11 +85,14 @@ def perform_filtered_math(content, cutoff_val, direction):
 
         cutoff = float(cutoff_val)
         
-        # Logic Map
         if direction in ["<", "below", "less", "smaller"]:
             filtered = [n for n in numbers if n < cutoff]
+        elif direction in ["<=", "at most", "up to"]:
+            filtered = [n for n in numbers if n <= cutoff]
         elif direction in [">", "above", "more", "greater", "larger"]:
             filtered = [n for n in numbers if n > cutoff]
+        elif direction in [">=", "at least", "minimum"]:
+            filtered = [n for n in numbers if n >= cutoff]
         elif direction in ["=", "equal", "=="]:
             filtered = [n for n in numbers if n == cutoff]
         elif direction in ["!=", "not", "different"]:
@@ -101,9 +100,9 @@ def perform_filtered_math(content, cutoff_val, direction):
         elif direction in ["%", "divisible", "mod"]:
             filtered = [n for n in numbers if n % cutoff == 0]
         else:
-            return int(sum(numbers))
+            return int(round(sum(numbers)))
 
-        result = int(sum(filtered))
+        result = int(round(sum(filtered)))
         print(f"✅ Calculation Result: {result}")
         return result
 
@@ -152,7 +151,6 @@ async def solve_quiz(start_url: str):
                 print("👀 Context acquired. Planning action...")
 
                 # --- 3. PLAN ACTION (LLM) ---
-                # FIX: Explicitly instructing "JSON" output to satisfy Azure constraints
                 system_prompt = """
                 You are an autonomous data extraction agent.
                 1. Analyze the HTML, Screenshot, and Audio Transcript.
@@ -160,6 +158,8 @@ async def solve_quiz(start_url: str):
                    {"action": "scrape", "scrape_url": "<url>", "headers": {"key": "val"}, "submit_url": "<url>"}
                 3. If instructions specify a MATH FILTER (e.g. "sum numbers < 5000"), extract it in JSON:
                    {"action": "scrape", "scrape_url": "<file_url>", "submit_url": "<url>", "math_filter": {"cutoff": 12000, "direction": "<"}}
+                   Directions: "<", ">", "<=", ">=", "=", "divisible"
+                   Check for "inclusive" language (e.g. "at most", "at least", "up to") and use "<=" or ">=".
                 4. If the answer is a CHART or IMAGE, generate SVG code for it.
                 5. If you have the answer, return valid JSON:
                    {"action": "submit", "answer": <value>, "submit_url": "<url>"}
@@ -192,14 +192,11 @@ async def solve_quiz(start_url: str):
                     target_url = urljoin(current_url, raw_scrape_url)
                     
                     print(f"🔎 Scraping: {target_url}")
-                    
-                    # Detect content type based on extension
                     path = urlparse(target_url).path.lower()
-                    is_image = path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
                     
-                    # A. Image Analysis (Vision)
-                    if is_image:
-                        print("🖼️ Detected Image. Downloading for Vision Analysis.")
+                    # A. Image Analysis
+                    if path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                        print("🖼️ Detected Image.")
                         img_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
                         if img_bytes:
                             b64_scraped = base64.b64encode(img_bytes).decode('utf-8')
@@ -207,7 +204,7 @@ async def solve_quiz(start_url: str):
                             vision_resp = await client.chat.completions.create(
                                 model="openai/gpt-4o-mini",
                                 messages=[
-                                    {"role": "system", "content": "Analyze the image. Return JSON: {\"answer\": <value>}"},
+                                    {"role": "system", "content": "Analyze the image. Return valid JSON: {\"answer\": <value>}"},
                                     {"role": "user", "content": [
                                         {"type": "text", "text": "What is the answer based on this image?"},
                                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_scraped}"}}
@@ -222,7 +219,6 @@ async def solve_quiz(start_url: str):
                         print("📂 Detected Data File.")
                         scraped_data = await fetch_external_content(target_url, headers=headers)
                         
-                        # Apply Math Filter if requested
                         math_req = llm_output.get("math_filter")
                         if math_req and scraped_data:
                             answer = perform_filtered_math(
@@ -232,7 +228,6 @@ async def solve_quiz(start_url: str):
                             )
                             if answer is not None: print(f"⚡ Math Result: {answer}")
 
-                        # Fallback to LLM Analysis
                         if answer is None and scraped_data:
                             print("Asking LLM to analyze text content...")
                             truncated_data = scraped_data[:50000]
@@ -250,13 +245,11 @@ async def solve_quiz(start_url: str):
                     else:
                         print("🌐 Detected Webpage. Rendering...")
                         page2 = await context.new_page()
-                        # Apply headers if possible (Playwright headers are complex, usually auth is query param)
                         await page2.goto(target_url, timeout=30000)
                         await page2.wait_for_load_state("networkidle")
                         scraped_html = await page2.content()
                         await page2.close()
                         
-                        # Recursive Analysis
                         print("Asking LLM to analyze scraped webpage...")
                         follow_up = await client.chat.completions.create(
                             model="openai/gpt-4o-mini",
@@ -269,7 +262,6 @@ async def solve_quiz(start_url: str):
                         answer = json.loads(follow_up.choices[0].message.content).get("answer")
 
                 else:
-                    # Direct Answer
                     answer = llm_output.get("answer")
 
                 # --- 5. SUBMIT ---
@@ -277,19 +269,18 @@ async def solve_quiz(start_url: str):
                     print("❌ Failure: No answer found.")
                     break
 
-                # Handle SVG/Chart generation requests
+                # SVG Handling
                 if isinstance(answer, str) and "<svg" in answer:
-                    print("🎨 Encoding SVG answer to Base64 data URI...")
+                    print("🎨 Encoding SVG...")
                     answer = "data:image/svg+xml;base64," + base64.b64encode(answer.encode('utf-8')).decode('utf-8')
 
-                # Safety: Fix relative URLs
+                # Safety: Fix URL & Unwrap Dicts
                 parsed_sub = urlparse(raw_submit_url)
                 if not parsed_sub.path or parsed_sub.path == "/":
                     submit_url = urljoin(current_url, "/submit")
                 else:
                     submit_url = urljoin(current_url, raw_submit_url)
 
-                # Safety: Unwrap Dicts
                 if isinstance(answer, dict):
                     candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url', 'answer']]
                     answer = candidates[0] if candidates else json.dumps(answer)
