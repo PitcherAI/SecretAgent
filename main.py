@@ -117,4 +117,5 @@ async def start(req: QuizRequest, tasks: BackgroundTasks):
 @app.get("/")
 async def health():
 
-    return {"status": "ok"}
+    return {"status": "200 ok"}
+
