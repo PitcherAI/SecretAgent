@@ -59,15 +59,17 @@ async def solve_quiz(start_url: str):
 
                 # 3. Ask LLM to solve it
                 # We ask the LLM to identify if it needs to scrape another URL
+                # FIX: Explicitly mentioned "JSON" to satisfy Azure/OpenAI requirements
                 system_prompt = """
                 You are an expert data extraction agent.
                 1. Analyze the HTML and screenshot.
-                2. If the user asks to "scrape" or "download" a DIFFERENT link to get the answer, return:
+                2. If the user asks to "scrape" or "download" a DIFFERENT link to get the answer, return valid JSON:
                    {"action": "scrape", "scrape_url": "<url_to_scrape>"}
-                3. If you have the answer, return:
+                3. If you have the answer, return valid JSON:
                    {"action": "submit", "answer": <value>, "submit_url": "<url_found>"}
                 4. Look inside HTML tags/scripts for hidden secrets.
                 5. Do NOT output the instruction text as the answer.
+                6. Your output must be a valid JSON object.
                 """
                 
                 response = await client.chat.completions.create(
@@ -104,7 +106,7 @@ async def solve_quiz(start_url: str):
                     follow_up_response = await client.chat.completions.create(
                         model="openai/gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Extract the answer from the scraped content below. Return JSON: {\"answer\": <value>, \"submit_url\": <from_previous_step>}"},
+                            {"role": "system", "content": "Extract the answer from the scraped content below. Return valid JSON: {\"answer\": <value>, \"submit_url\": <from_previous_step>}"},
                             {"role": "user", "content": f"Original Page HTML: {html_content}\n\nScraped External Content: {scraped_content}"}
                         ],
                         response_format={"type": "json_object"}
