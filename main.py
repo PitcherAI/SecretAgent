@@ -226,7 +226,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                     # --- SUBMIT SCRAPE GUARD ---
                     # If Agent tries to scrape /submit, intervene and set answer to email
                     if "/submit" in raw_scrape_url or "submit" == raw_scrape_url.strip("/"):
-                        print(f"⚠️ Agent tried to scrape submit URL. Correcting to Email Submission...")
+                        print(f"⚠️ Agent tried to scrape submit URL '{raw_scrape_url}'. Correcting to Email Submission...")
                         answer = user_email
                         raw_submit_url = "/submit"
                     else:
@@ -279,7 +279,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                             follow_up = await client.chat.completions.create(
                                 model="openai/gpt-4o-mini",
                                 messages=[
-                                    {"role": "system", "content": "Analyze data. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer'."},
+                                    {"role": "system", "content": "Analyze the data. You can write Python code. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer' in python code."},
                                     {"role": "user", "content": f"Data:\n{scraped_data[:50000]}"}
                                 ],
                                 response_format={"type": "json_object"}
@@ -339,9 +339,19 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                     break
 
                 # --- SUBMISSION ---
+                # Default to /submit if missing
+                if not raw_submit_url: raw_submit_url = "/submit"
                 submit_url = urljoin(current_url, raw_submit_url)
                 
+                # --- SUBMISSION GUARD ---
+                # If Agent tries to submit to the page URL itself, redirect to /submit
+                if urlparse(submit_url).path == urlparse(current_url).path:
+                    print(f"⚠️ Agent error: Tried submitting to page URL. Redirecting to /submit...")
+                    submit_url = urljoin(current_url, "/submit")
+
+                # BUG FIX: Allow 'answer' key to be extracted
                 if isinstance(answer, dict):
+                    # Filter out metadata keys, but KEEP 'answer'
                     candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url']]
                     if candidates:
                         answer = candidates[0]
@@ -376,8 +386,11 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
 
 @app.post("/run")
 async def start_quiz(request: QuizRequest, background_tasks: BackgroundTasks):
+    # Verify the secret matches what we expect (Auth Check)
     if request.secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Bad Secret")
+    
+    # Pass the request credentials specifically to the worker
     background_tasks.add_task(solve_quiz, request.url, request.email, request.secret)
     return {"message": "Started", "status": "ok"}
 
