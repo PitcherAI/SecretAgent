@@ -177,18 +177,21 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                    Return: {{"action": "submit", "answer": "{user_email}", "submit_url": "<url>"}}
                 3. NAVIGATION: If text says "Add ?email=..." or "Go to...", return: 
                    {{"action": "scrape", "scrape_url": "<modified_url>", "submit_url": "<url>"}}
-                4. DATA SCRAPING: If you need data from a file/API/PDF, return:
+                4. COMMANDS: If the page says run `uv http get <url>` or `curl <url>`, DO NOT submit the command.
+                   Instead, SCRAPE that URL with the headers shown.
+                   Return: {{"action": "scrape", "scrape_url": "<extracted_url>", "headers": {{"Accept": "application/json"}}, "submit_url": "<url>"}}
+                5. DATA SCRAPING: If you need data from a file/API/PDF, return:
                    {{"action": "scrape", "scrape_url": "<url>", "headers": {{"key": "val"}}, "submit_url": "<url>"}}
                    *DO NOT SCRAPE the submit URL (e.g. /submit).*
-                5. ANALYSIS:
+                6. ANALYSIS:
                    - For simple math filters ("sum < 5000"), use "math_filter" key.
                    - For COMPLEX analysis (Geo, Network, ML, Sorting, Transformation), write Python code.
                      Return: {{"action": "python", "code": "<python_code>", "submit_url": "<url>"}}
                      *Note: In your code, the file content is available in variable `data`.*
-                6. VISUALIZATION: If asked for a chart, generate SVG code in the answer.
-                7. ANSWER: If you have the answer, return:
+                7. VISUALIZATION: If asked for a chart, generate SVG code in the answer.
+                8. ANSWER: If you have the answer, return:
                    {{"action": "submit", "answer": <value>, "submit_url": "<url>"}}
-                8. Output valid JSON.
+                9. Output valid JSON.
                 """
                 
                 response = await client.chat.completions.create(
@@ -270,7 +273,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                             answer = json.loads(follow_up.choices[0].message.content).get("answer")
 
                         # 3. Data File / API
-                        elif path.endswith(('.csv', '.txt', '.json', '.xml')) or "/api/" in target_url:
+                        elif path.endswith(('.csv', '.txt', '.json', '.xml')) or "/api/" in target_url or ".json" in target_url:
                             scraped_data = await fetch_external_content(target_url, headers=headers)
                             
                             # Fallback: Python Execution for Analysis
