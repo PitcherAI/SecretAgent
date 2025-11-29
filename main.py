@@ -246,7 +246,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                    - For simple math ("sum < 5000"), use "math_filter" key.
                    - For COMPLEX analysis (Geo, Network, ML, Sorting), use "python".
                      Return: {"action": "python", "code": "<python_code>", "submit_url": "<url>"}
-                     *IMPORTANT: In your Python code, you MUST 'print(result)' or assign to 'answer' variable. The file content is in 'data' string.*
+                     *IMPORTANT: In your Python code, assign the final result to variable 'answer'. E.g. answer = 42.*
                 5. ANSWER: If you have the answer, return:
                    {"action": "submit", "answer": <value>, "submit_url": "<url>"}
                 6. Default "submit_url" to "/submit". Output Valid JSON.
@@ -276,7 +276,6 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                 # ACTION: PYTHON
                 if llm_output.get("action") == "python":
                     code = llm_output.get("code")
-                    # Python operates on HTML content by default if no file scraped
                     answer = execute_python(code, html_content)
 
                 # ACTION: SCRAPE
@@ -284,7 +283,6 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                     raw_scrape_url = llm_output.get("scrape_url")
                     headers = llm_output.get("headers", {})
                     
-                    # Auto-inject headers
                     if "/api/" in raw_scrape_url or "vercel.app" in raw_scrape_url:
                         if "email" not in headers:
                             headers["email"] = user_email
@@ -338,13 +336,12 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                             answer = perform_filtered_math(scraped_data, math_context["cutoff"], math_context["dir"], math_context["metric"])
                             print(f"⚡ Math Result 1: {answer}")
 
-                        # Fallback: Python Execution for Analysis
                         if answer is None and scraped_data:
                             print("Asking LLM to analyze/process data...")
                             follow_up = await client.chat.completions.create(
                                 model="openai/gpt-4o-mini",
                                 messages=[
-                                    {"role": "system", "content": "Analyze the data. You can write Python code. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: In Python code, PRINT the result."},
+                                    {"role": "system", "content": "Analyze the data. You can write Python code. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer' in python code."},
                                     {"role": "user", "content": f"Data:\n{scraped_data[:50000]}"}
                                 ],
                                 response_format={"type": "json_object"}
@@ -352,15 +349,6 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                             res_json = json.loads(follow_up.choices[0].message.content)
                             if "python_code" in res_json:
                                 answer = execute_python(res_json["python_code"], scraped_data)
-                                # EMERGENCY FALLBACK: If code printed nothing, ask LLM to do it textually
-                                if not answer:
-                                    print("⚠️ Code returned nothing. Retrying with text analysis...")
-                                    text_solve = await client.chat.completions.create(
-                                        model="openai/gpt-4o-mini",
-                                        messages=[{"role": "user", "content": f"The code failed. Solve this manually:\n{scraped_data[:10000]}"}],
-                                        response_format={"type": "json_object"}
-                                    )
-                                    answer = json.loads(text_solve.choices[0].message.content).get("answer")
                             else:
                                 answer = res_json.get("answer")
 
@@ -392,9 +380,14 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                 # --- SUBMISSION ---
                 submit_url = urljoin(current_url, raw_submit_url)
                 
+                # BUG FIX: Allow 'answer' key to be extracted
                 if isinstance(answer, dict):
-                    cands = [v for k, v in answer.items() if k not in ['email', 'secret', 'url', 'answer']]
-                    answer = cands[0] if cands else json.dumps(answer)
+                    # Filter out metadata keys, but KEEP 'answer'
+                    candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url']]
+                    if candidates:
+                        answer = candidates[0]
+                    else:
+                        answer = json.dumps(answer)
 
                 if isinstance(answer, str) and "<svg" in answer:
                     answer = "data:image/svg+xml;base64," + base64.b64encode(answer.encode('utf-8')).decode('utf-8')
