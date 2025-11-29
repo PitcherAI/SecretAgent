@@ -177,9 +177,9 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                    Return: {{"action": "submit", "answer": "{user_email}", "submit_url": "<url>"}}
                 3. NAVIGATION: If text says "Add ?email=..." or "Go to...", return: 
                    {{"action": "scrape", "scrape_url": "<modified_url>", "submit_url": "<url>"}}
-                4. COMMANDS: If page says run `uv http get <url>` or `curl <url>`, DO NOT submit command.
-                   SCRAPE that URL with headers shown.
-                   Return: {{"action": "scrape", "scrape_url": "<extracted_url>", "headers": {{"Accept": "application/json"}}, "submit_url": "<url>"}}
+                4. COMMANDS: 
+                   - If page says "submit the command string" or "not the output", SUBMIT the full command text (e.g. `uv http get...`).
+                   - If page says "run this command", SCRAPE the URL in the command.
                 5. DATA SCRAPING: If you need data from a file/API/PDF, return:
                    {{"action": "scrape", "scrape_url": "<url>", "headers": {{"key": "val"}}, "submit_url": "<url>"}}
                    *DO NOT SCRAPE the submit URL (e.g. /submit).*
@@ -223,20 +223,16 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                 elif llm_output.get("action") == "scrape":
                     raw_scrape_url = llm_output.get("scrape_url")
                     
-                    # --- CRITICAL FIX: SUBMIT SCRAPE GUARD ---
+                    # --- SUBMIT SCRAPE GUARD ---
                     # If Agent tries to scrape /submit, intervene and set answer to email
                     if "/submit" in raw_scrape_url or "submit" == raw_scrape_url.strip("/"):
-                        print(f"⚠️ Agent tried to scrape submit URL '{raw_scrape_url}'. Correcting to Email Submission...")
+                        print(f"⚠️ Agent tried to scrape submit URL. Correcting to Email Submission...")
                         answer = user_email
-                        # Force submit URL to be correct if agent was confused
                         raw_submit_url = "/submit"
                     else:
                         headers = llm_output.get("headers", {})
-                        
-                        # Auto-Inject headers for API calls using credentials from REQUEST
                         if "/api/" in raw_scrape_url or "vercel.app" in raw_scrape_url:
                             if "email" not in headers:
-                                print("💉 Auto-injecting Request Credentials into Headers...")
                                 headers["email"] = user_email
                                 headers["secret"] = user_secret
 
@@ -283,7 +279,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                             follow_up = await client.chat.completions.create(
                                 model="openai/gpt-4o-mini",
                                 messages=[
-                                    {"role": "system", "content": "Analyze the data. You can write Python code. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer' in python code."},
+                                    {"role": "system", "content": "Analyze data. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer'."},
                                     {"role": "user", "content": f"Data:\n{scraped_data[:50000]}"}
                                 ],
                                 response_format={"type": "json_object"}
@@ -315,23 +311,37 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                 else:
                     answer = llm_output.get("answer")
 
+                # --- INTERCEPTOR LOGIC (RELAXED) ---
+                # Only execute commands if the prompt DOESN'T say "submit command"
+                if isinstance(answer, str) and (answer.strip().startswith("uv ") or answer.strip().startswith("curl ")):
+                    # Check instructions in HTML to decide whether to EXECUTE or SUBMIT
+                    # Heuristic: If HTML contains "not the output", we skip execution and submit the string.
+                    if "not the output" in html_content.lower() or "exact command string" in html_content.lower():
+                        print(f"⚠️ Passing command string AS IS (per instructions): {answer}")
+                    else:
+                        print(f"⚠️ Intercepted Command: '{answer}'. Executing...")
+                        url_match = re.search(r'(https?://[^\s]+)', answer)
+                        if url_match:
+                            cmd_url = url_match.group(1)
+                            cmd_headers = {}
+                            if "json" in answer: cmd_headers["Accept"] = "application/json"
+                            
+                            fetched_data = await fetch_external_content(cmd_url, headers=cmd_headers)
+                            if fetched_data:
+                                try:
+                                    answer = json.loads(fetched_data)
+                                    print("✅ Fetched JSON Data.")
+                                except:
+                                    answer = fetched_data
+
                 if answer is None:
                     print("❌ Failure: No answer found.")
                     break
 
                 # --- SUBMISSION ---
-                # Fix: Default to /submit if current_url is page url and raw_submit is missing or relative
-                if not raw_submit_url: raw_submit_url = "/submit"
                 submit_url = urljoin(current_url, raw_submit_url)
                 
-                # If submit url is the same as current url, force /submit endpoint
-                if submit_url.strip("/") == current_url.strip("/"):
-                    print("⚠️ Loop Detected: Forcing submit URL to /submit")
-                    submit_url = urljoin(current_url, "/submit")
-
-                # BUG FIX: Allow 'answer' key to be extracted
                 if isinstance(answer, dict):
-                    # Filter out metadata keys, but KEEP 'answer'
                     candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url']]
                     if candidates:
                         answer = candidates[0]
@@ -343,7 +353,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
 
                 payload = {"email": user_email, "secret": user_secret, "url": current_url, "answer": answer}
                 
-                print(f"📤 Submitting: {answer} to {submit_url}")
+                print(f"📤 Submitting: {answer}")
                 async with httpx.AsyncClient() as http:
                     resp = await http.post(submit_url, json=payload, timeout=30)
                     try: res = resp.json()
@@ -366,11 +376,8 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
 
 @app.post("/run")
 async def start_quiz(request: QuizRequest, background_tasks: BackgroundTasks):
-    # Verify the secret matches what we expect (Auth Check)
     if request.secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Bad Secret")
-    
-    # Pass the request credentials specifically to the worker
     background_tasks.add_task(solve_quiz, request.url, request.email, request.secret)
     return {"message": "Started", "status": "ok"}
 
