@@ -177,8 +177,8 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                    Return: {{"action": "submit", "answer": "{user_email}", "submit_url": "<url>"}}
                 3. NAVIGATION: If text says "Add ?email=..." or "Go to...", return: 
                    {{"action": "scrape", "scrape_url": "<modified_url>", "submit_url": "<url>"}}
-                4. COMMANDS: If the page says run `uv http get <url>` or `curl <url>`, DO NOT submit the command.
-                   Instead, SCRAPE that URL with the headers shown.
+                4. COMMANDS: If page says run `uv http get <url>` or `curl <url>`, DO NOT submit command.
+                   SCRAPE that URL with headers shown.
                    Return: {{"action": "scrape", "scrape_url": "<extracted_url>", "headers": {{"Accept": "application/json"}}, "submit_url": "<url>"}}
                 5. DATA SCRAPING: If you need data from a file/API/PDF, return:
                    {{"action": "scrape", "scrape_url": "<url>", "headers": {{"key": "val"}}, "submit_url": "<url>"}}
@@ -228,6 +228,8 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                     if "/submit" in raw_scrape_url or "submit" == raw_scrape_url.strip("/"):
                         print(f"⚠️ Agent tried to scrape submit URL '{raw_scrape_url}'. Correcting to Email Submission...")
                         answer = user_email
+                        # Force submit URL to be correct if agent was confused
+                        raw_submit_url = "/submit"
                     else:
                         headers = llm_output.get("headers", {})
                         
@@ -318,8 +320,15 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                     break
 
                 # --- SUBMISSION ---
+                # Fix: Default to /submit if current_url is page url and raw_submit is missing or relative
+                if not raw_submit_url: raw_submit_url = "/submit"
                 submit_url = urljoin(current_url, raw_submit_url)
                 
+                # If submit url is the same as current url, force /submit endpoint
+                if submit_url.strip("/") == current_url.strip("/"):
+                    print("⚠️ Loop Detected: Forcing submit URL to /submit")
+                    submit_url = urljoin(current_url, "/submit")
+
                 # BUG FIX: Allow 'answer' key to be extracted
                 if isinstance(answer, dict):
                     # Filter out metadata keys, but KEEP 'answer'
@@ -334,7 +343,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
 
                 payload = {"email": user_email, "secret": user_secret, "url": current_url, "answer": answer}
                 
-                print(f"📤 Submitting: {answer}")
+                print(f"📤 Submitting: {answer} to {submit_url}")
                 async with httpx.AsyncClient() as http:
                     resp = await http.post(submit_url, json=payload, timeout=30)
                     try: res = resp.json()
