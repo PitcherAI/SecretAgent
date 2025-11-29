@@ -32,9 +32,16 @@ app = FastAPI()
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
+# Client for Chat (Text/Vision) -> OpenRouter
 client = AsyncOpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openrouter/v1"
+)
+
+# Client for Audio (Whisper) -> OpenAI (AI Pipe routes this differently)
+audio_client = AsyncOpenAI(
+    api_key=os.environ.get("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openai/v1"
 )
 
 STUDENT_EMAIL = os.environ.get("STUDENT_EMAIL")
@@ -49,27 +56,16 @@ class QuizRequest(BaseModel):
 # HELPER: SESSION PRESERVATION
 # ------------------------------------------------------------------
 def normalize_url(base_url, target_url):
-    """
-    Ensures target_url keeps the query parameters (email, id) from base_url.
-    Prevents 'Please provide ?email=' errors.
-    """
-    # 1. Resolve relative path
     full_url = urljoin(base_url, target_url)
-    
-    # 2. Parse both URLs
     base_parsed = urlparse(base_url)
     target_parsed = urlparse(full_url)
-    
-    # 3. Merge Query Params
     base_qs = parse_qs(base_parsed.query)
     target_qs = parse_qs(target_parsed.query)
     
-    # Target params override base params, but we ensure 'email' is always present
     for k, v in base_qs.items():
         if k not in target_qs:
             target_qs[k] = v
             
-    # 4. Rebuild URL
     new_query = urlencode(target_qs, doseq=True)
     return target_parsed._replace(query=new_query).geturl()
 
@@ -78,14 +74,12 @@ def normalize_url(base_url, target_url):
 # ------------------------------------------------------------------
 async def fetch_external_content(url, headers=None, is_binary=False):
     if headers is None: headers = {}
-    
-    # Auto-inject headers for API calls
     if "/api/" in url or "vercel.app" in url:
         if "email" not in headers:
             headers["email"] = STUDENT_EMAIL
             headers["secret"] = STUDENT_SECRET
 
-    print(f"📥 Fetching: {url} (Headers: {list(headers.keys())})")
+    print(f"📥 Fetching: {url}")
     try:
         async with httpx.AsyncClient() as http_client:
             resp = await http_client.get(url, headers=headers, timeout=30, follow_redirects=True)
@@ -101,11 +95,11 @@ async def fetch_external_content(url, headers=None, is_binary=False):
 # HELPER: PDF PARSING
 # ------------------------------------------------------------------
 def read_pdf(pdf_bytes):
-    if not pypdf: return "Error: pypdf not installed. Cannot read PDF."
+    if not pypdf: return "Error: pypdf not installed."
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         text = "\n".join([page.extract_text() for page in reader.pages[:10]])
-        return text[:20000]
+        return text[:20000] 
     except Exception as e:
         return f"PDF Error: {e}"
 
@@ -113,12 +107,13 @@ def read_pdf(pdf_bytes):
 # HELPER: AUDIO TRANSCRIPTION
 # ------------------------------------------------------------------
 async def transcribe_audio(audio_bytes, filename="audio.mp3"):
-    print(f"🎤 Transcribing audio ({len(audio_bytes)} bytes)...")
+    print(f"🎤 Transcribing ({len(audio_bytes)} bytes)...")
     try:
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = filename
-        transcription = await client.audio.transcriptions.create(
-            model="openai/whisper-1", 
+        # Use audio_client (OpenAI endpoint) for Whisper
+        transcription = await audio_client.audio.transcriptions.create(
+            model="whisper-1", 
             file=audio_file
         )
         print(f"🗣️ Transcript: {transcription.text}")
@@ -182,14 +177,13 @@ def perform_filtered_math(content, cutoff_val, direction, metric="sum"):
         print(f"🧮 Math: {len(numbers)} nums. Filter: {direction} {cutoff_val}. Metric: {metric}")
         cutoff = float(cutoff_val)
         
-        # Logic Map
         if direction in ["<", "below", "less"]:
             filtered = [n for n in numbers if n < cutoff]
-        elif direction in ["<=", "at most", "up to", "max", "maximum"]:
+        elif direction in ["<=", "at most", "up to", "max"]:
             filtered = [n for n in numbers if n <= cutoff]
-        elif direction in [">", "above", "more", "greater"]:
+        elif direction in [">", "above", "more"]:
             filtered = [n for n in numbers if n > cutoff]
-        elif direction in [">=", "at least", "min", "minimum"]:
+        elif direction in [">=", "at least", "min"]:
             filtered = [n for n in numbers if n >= cutoff]
         elif direction in ["=", "=="]:
             filtered = [n for n in numbers if n == cutoff]
@@ -221,7 +215,7 @@ def perform_filtered_math(content, cutoff_val, direction, metric="sum"):
 # CORE AGENT LOGIC
 # ------------------------------------------------------------------
 async def solve_quiz(start_url: str, user_email: str, user_secret: str):
-    print(f"🚀 Starting task: {start_url} for {user_email}")
+    print(f"🚀 Starting task: {start_url}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -249,7 +243,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                 screenshot = await page.screenshot(type="png")
                 b64_img = base64.b64encode(screenshot).decode('utf-8')
                 
-                # --- AUDIO DETECT ---
+                # --- AUDIO DETECT (Embedded) ---
                 audio_transcript = ""
                 audio_element = await page.query_selector("audio source, a[href$='.mp3'], a[href$='.wav']")
                 if audio_element:
@@ -260,42 +254,33 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                         if audio_bytes:
                             audio_transcript = await transcribe_audio(audio_bytes)
 
-                # --- RESILIENCE LOOP (Retry on same page) ---
+                # --- RESILIENCE LOOP ---
                 feedback_history = []
                 success = False
                 
-                # Try up to 5 times on the same URL before giving up
                 for attempt_idx in range(5):
-                    if attempt_idx > 0:
-                        print(f"🔄 Retry Attempt {attempt_idx + 1}/5 on same page...")
+                    if attempt_idx > 0: print(f"🔄 Retry {attempt_idx+1}/5...")
 
-                    # --- PLANNING ---
                     system_prompt = f"""
-                    You are an autonomous data extraction agent.
+                    You are a data extraction agent.
                     YOUR EMAIL: {user_email}
                     
-                    1. Analyze HTML, Screenshot, and Audio.
+                    1. Analyze HTML, Screenshot, and Audio Transcript.
                     2. PREVIOUS MISTAKES: {json.dumps(feedback_history)}
-                       *If previous attempts failed, TRY A DIFFERENT APPROACH (e.g., scrape a DIFFERENT link, flip math logic, or change scraping target).*
                     
-                    3. STARTING: If the page asks to start/begin or for an email, the answer is "{user_email}".
-                       Return: {{"action": "submit", "answer": "{user_email}", "submit_url": "<url>"}}
+                    3. FILES & AUDIO: If there is a link to an Audio file (.opus/.mp3) or Data file, SCRAPE IT.
+                       Return: {{"action": "scrape", "scrape_url": "<file_url>", "submit_url": "<url>"}}
                     
-                    4. COMMANDS: 
-                       - If page says "submit the command string" or "not the output", SUBMIT the full command text (e.g. `uv http get...`).
-                       - If page says "run this command", SCRAPE the URL in the command.
+                    4. COMMANDS: If page says run `uv` or `curl`, submit the FULL command string as the answer (DO NOT execute it unless asked for output).
                     
-                    5. DATA SCRAPING: If you need data from a file/API/PDF, return:
-                       {{"action": "scrape", "scrape_url": "<url>", "headers": {{"key": "val"}}, "submit_url": "<url>"}}
-                       *DO NOT SCRAPE the submit URL.*
+                    5. MATH: If filter logic found, use:
+                       {{"action": "scrape", "scrape_url": "<file>", "math_filter": {{"cutoff": 12000, "direction": "<=", "metric": "sum"}}}}
                     
-                    6. MATH: If instructions specify a filter, extract it:
-                       {{"action": "scrape", "scrape_url": "<file>", "submit_url": "<url>", "math_filter": {{"cutoff": 12000, "direction": "<=", "metric": "sum"}}}}
+                    6. STARTING: If page asks for email to start, answer is "{user_email}".
                     
-                    7. ANSWER: If you have the answer, return:
-                       {{"action": "submit", "answer": <value>, "submit_url": "<url>"}}
+                    7. ANSWER: Return {{"action": "submit", "answer": <value>, "submit_url": "<url>"}}
                     
-                    8. Output valid JSON.
+                    8. Output valid JSON. Default submit_url: "/submit".
                     """
                     
                     response = await client.chat.completions.create(
@@ -303,7 +288,7 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": [
-                                {"type": "text", "text": f"HTML:\n{html_content[:30000]}\n\nAudio:\n{audio_transcript}"},
+                                {"type": "text", "text": f"HTML:\n{html_content[:30000]}\n\nAudio Transcript:\n{audio_transcript}"},
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                             ]}
                         ],
@@ -318,66 +303,78 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                     math_context = {} 
 
                     # --- EXECUTION ---
-                    
-                    # ACTION: PYTHON
                     if llm_output.get("action") == "python":
                         code = llm_output.get("code")
                         answer = execute_python(code, html_content)
 
-                    # ACTION: SCRAPE
                     elif llm_output.get("action") == "scrape":
                         raw_scrape_url = llm_output.get("scrape_url")
                         
+                        # Guard: Don't scrape submit URL
                         if "/submit" in raw_scrape_url or "submit" == raw_scrape_url.strip("/"):
-                            print(f"⚠️ Correction: Setting answer to email.")
                             answer = user_email
                             raw_submit_url = "/submit"
                         else:
                             headers = llm_output.get("headers", {})
-                            if "/api/" in raw_scrape_url or "vercel.app" in raw_scrape_url:
-                                if "email" not in headers:
-                                    headers["email"] = user_email
-                                    headers["secret"] = user_secret
+                            if "/api/" in raw_scrape_url:
+                                headers["email"] = user_email
+                                headers["secret"] = user_secret
 
-                            # Fix: Normalize URL to keep query params
                             target_url = normalize_url(current_url, raw_scrape_url)
                             print(f"🔎 Scraping: {target_url}")
                             path = urlparse(target_url).path.lower()
                             
-                            # 1. Image
-                            if path.endswith(('.png', '.jpg', '.jpeg')):
+                            # 1. AUDIO (Moved to TOP Priority)
+                            if path.endswith(('.mp3', '.wav', '.opus', '.ogg')):
+                                print("🎵 Detected Audio File.")
+                                audio_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
+                                if audio_bytes:
+                                    ext = os.path.splitext(path)[1]
+                                    transcript = await transcribe_audio(audio_bytes, f"file{ext}")
+                                    
+                                    # Ask LLM to solve based on transcript
+                                    follow_up = await client.chat.completions.create(
+                                        model="openai/gpt-4o-mini",
+                                        messages=[
+                                            {"role": "system", "content": "Extract the code/answer from the transcript. JSON: {\"answer\": <val>}"},
+                                            {"role": "user", "content": f"Transcript:\n{transcript}"}
+                                        ],
+                                        response_format={"type": "json_object"}
+                                    )
+                                    answer = json.loads(follow_up.choices[0].message.content).get("answer")
+
+                            # 2. Image
+                            elif path.endswith(('.png', '.jpg', '.jpeg')):
                                 img_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
                                 if img_bytes:
                                     b64_scraped = base64.b64encode(img_bytes).decode('utf-8')
                                     vision_resp = await client.chat.completions.create(
                                         model="openai/gpt-4o-mini",
                                         messages=[
-                                            {"role": "system", "content": "Analyze image. Return JSON: {\"answer\": <value>}"},
+                                            {"role": "system", "content": "Analyze image. JSON: {\"answer\": <val>}"},
                                             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_scraped}"}}]}
                                         ],
                                         response_format={"type": "json_object"}
                                     )
                                     answer = json.loads(vision_resp.choices[0].message.content).get("answer")
 
-                            # 2. PDF
+                            # 3. PDF
                             elif path.endswith('.pdf'):
                                 pdf_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
                                 pdf_text = read_pdf(pdf_bytes)
                                 follow_up = await client.chat.completions.create(
                                     model="openai/gpt-4o-mini",
                                     messages=[
-                                        {"role": "system", "content": "Analyze PDF text. Return JSON: {\"answer\": <value>}"},
-                                        {"role": "user", "content": f"PDF Content:\n{pdf_text}"}
+                                        {"role": "system", "content": "Analyze PDF. JSON: {\"answer\": <val>}"},
+                                        {"role": "user", "content": f"PDF:\n{pdf_text}"}
                                     ],
                                     response_format={"type": "json_object"}
                                 )
                                 answer = json.loads(follow_up.choices[0].message.content).get("answer")
 
-                            # 3. Data File / API
-                            elif path.endswith(('.csv', '.txt', '.json', '.xml')) or "/api/" in target_url or ".json" in target_url:
+                            # 4. Data File / API
+                            else:
                                 scraped_data = await fetch_external_content(target_url, headers=headers)
-                                
-                                # Check Math
                                 math_req = llm_output.get("math_filter")
                                 if math_req and scraped_data:
                                     math_context = {
@@ -389,13 +386,11 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                                     answer = perform_filtered_math(scraped_data, math_context["cutoff"], math_context["dir"], math_context["metric"])
                                     print(f"⚡ Math Result 1: {answer}")
 
-                                # Fallback: Python Execution
                                 if answer is None and scraped_data:
-                                    print("Asking LLM to analyze/process data...")
                                     follow_up = await client.chat.completions.create(
                                         model="openai/gpt-4o-mini",
                                         messages=[
-                                            {"role": "system", "content": "Analyze the data. You can write Python code. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer'."},
+                                            {"role": "system", "content": "Analyze data. Return JSON: {\"answer\": <val>} OR {\"python_code\": <code>}. IMPORTANT: Assign result to variable 'answer'."},
                                             {"role": "user", "content": f"Data:\n{scraped_data[:50000]}"}
                                         ],
                                         response_format={"type": "json_object"}
@@ -406,53 +401,27 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                                     else:
                                         answer = res_json.get("answer")
 
-                            # 4. Webpage
-                            else:
-                                print("🌐 Webpage Scrape")
-                                page2 = await context.new_page()
-                                await page2.goto(target_url, timeout=30000)
-                                scraped_html = await page2.content()
-                                await page2.close()
-                                
-                                follow_up = await client.chat.completions.create(
-                                    model="openai/gpt-4o-mini",
-                                    messages=[
-                                        {"role": "system", "content": "Analyze page. Return JSON: {\"answer\": <value>}"},
-                                        {"role": "user", "content": f"Main:\n{html_content}\nScraped:\n{scraped_html}"}
-                                    ],
-                                    response_format={"type": "json_object"}
-                                )
-                                answer = json.loads(follow_up.choices[0].message.content).get("answer")
-
                     else:
                         answer = llm_output.get("answer")
 
-                    # --- INTERCEPTOR (UV/CURL) ---
+                    # Interceptor
                     if isinstance(answer, str) and (answer.strip().startswith("uv ") or answer.strip().startswith("curl ")):
                         if "not the output" in html_content.lower() or "exact command string" in html_content.lower():
-                            print(f"⚠️ Passing command string AS IS (per instructions): {answer}")
+                            print(f"⚠️ Passing command string AS IS: {answer}")
                         else:
-                            print(f"⚠️ Intercepted Command: '{answer}'. Executing...")
+                            print(f"⚠️ Executing Command: {answer}")
                             url_match = re.search(r'(https?://[^\s]+)', answer)
                             if url_match:
-                                cmd_url = url_match.group(1)
-                                cmd_headers = {}
-                                if "json" in answer: cmd_headers["Accept"] = "application/json"
-                                fetched_data = await fetch_external_content(cmd_url, headers=cmd_headers)
-                                if fetched_data:
-                                    try:
-                                        answer = json.loads(fetched_data)
-                                    except:
-                                        answer = fetched_data
+                                headers = {"Accept": "application/json"}
+                                fetched = await fetch_external_content(url_match.group(1), headers=headers)
+                                if fetched: answer = json.loads(fetched)
 
                     if answer is None:
-                        feedback_history.append(f"Plan {llm_output} produced NO answer. Try something else.")
+                        feedback_history.append(f"Plan {llm_output} produced NO answer.")
                         continue
 
                     # --- SUBMISSION ---
-                    # Default to /submit if missing
                     if not raw_submit_url: raw_submit_url = "/submit"
-                    # Fix: Normalize URL to keep query params
                     submit_url = normalize_url(current_url, raw_submit_url)
                     
                     if urlparse(submit_url).path == urlparse(current_url).path:
@@ -476,34 +445,31 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
                         
                     print(f"✅ Result: {res}")
                     
-                    # --- AUTO-RETRY LOGIC (Math Flip) ---
+                    # --- MATH RETRY ---
                     if not res.get("correct") and math_context and "Wrong sum" in str(res):
-                        print("🔄 Fast Math Retry: Flipping logic...")
+                        print("🔄 Math Retry: Flipping logic...")
                         old_dir = math_context["dir"]
                         new_dir = "<" if old_dir == "<=" else ("<=" if old_dir == "<" else old_dir)
-                        if new_dir == old_dir:
-                            new_dir = ">" if old_dir == ">=" else (">=" if old_dir == ">" else old_dir)
+                        if new_dir == old_dir: new_dir = ">" if old_dir == ">=" else (">=" if old_dir == ">" else old_dir)
 
                         if new_dir != old_dir:
                             retry_ans = perform_filtered_math(math_context["data"], math_context["cutoff"], new_dir, math_context["metric"])
                             print(f"⚡ Retry Math: {retry_ans}")
                             payload["answer"] = retry_ans
                             async with httpx.AsyncClient() as http:
-                                resp = await http.post(submit_url, json=payload, timeout=20)
+                                resp = await http.post(submit_url, json=payload, timeout=30)
                                 res = resp.json()
-                            print(f"✅ Fast Retry Result: {res}")
+                            print(f"✅ Retry Result: {res}")
 
                     if res.get("correct"):
                         current_url = res.get("url")
                         success = True
-                        break # Break Retry Loop, Go to Next Page
+                        break 
                     else:
-                        print(f"⛔ Attempt failed: {res.get('reason')}")
-                        feedback_history.append(f"Answer '{answer}' for plan {llm_output} failed. Reason: {res.get('reason')}")
-                        # Loop continues to next attempt attempt_idx
+                        feedback_history.append(f"Answer '{answer}' failed: {res.get('reason')}")
 
                 if not success:
-                    print("❌ All retries failed for this URL. Stopping.")
+                    print("❌ All retries failed. Stopping.")
                     break
                     
             except Exception as e:
@@ -515,11 +481,8 @@ async def solve_quiz(start_url: str, user_email: str, user_secret: str):
 
 @app.post("/run")
 async def start_quiz(request: QuizRequest, background_tasks: BackgroundTasks):
-    # Verify the secret matches what we expect (Auth Check)
     if request.secret != STUDENT_SECRET:
         raise HTTPException(status_code=403, detail="Bad Secret")
-    
-    # Pass the request credentials specifically to the worker
     background_tasks.add_task(solve_quiz, request.url, request.email, request.secret)
     return {"message": "Started", "status": "ok"}
 
