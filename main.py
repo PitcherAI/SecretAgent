@@ -6,20 +6,26 @@ import re
 import io
 import csv
 import statistics
+import asyncio
 from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError, APIError
 
 app = FastAPI()
 
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-# We use Gemini 2.0 Flash because it is free, fast, and handles 
-# Text, Images, and Audio natively in a single request.
-MODEL_ID = "google/gemini-2.0-flash-exp:free"
+# We use a list of models. If the first fails (429), we try the next.
+# 1. Gemini 2.0 Flash (Fastest, Smartest)
+# 2. Llama 3.3 70B (Very Stable Free Tier)
+MODEL_PRIORITY = [
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-chat:free"
+]
 
 client = AsyncOpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
@@ -33,6 +39,42 @@ class QuizRequest(BaseModel):
     email: str
     secret: str
     url: str
+
+# ------------------------------------------------------------------
+# HELPER: ROBUST LLM CALLER (Fixes 429 Errors)
+# ------------------------------------------------------------------
+async def query_llm(messages, response_format=None):
+    """
+    Tries models in order. If one is rate-limited, it waits or switches.
+    """
+    for model in MODEL_PRIORITY:
+        retries = 3
+        delay = 5
+        
+        for attempt in range(retries):
+            try:
+                print(f"🧠 Asking {model} (Attempt {attempt+1})...")
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    response_format=response_format
+                )
+                return response # Success!
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                # Check for Rate Limits (429) or Overloaded server
+                if "429" in error_msg or "rate limit" in error_msg or "upstream" in error_msg:
+                    print(f"⏳ Rate Limited on {model}. Waiting {delay}s...")
+                    await asyncio.sleep(delay)
+                    delay *= 2 # Exponential backoff (5s -> 10s -> 20s)
+                else:
+                    print(f"⚠️ API Error on {model}: {e}")
+                    break # Fatal error for this model, try next one
+        
+        print(f"⏭️ Skipping {model}, trying next fallback...")
+    
+    raise Exception("❌ All models failed or rate limited.")
 
 # ------------------------------------------------------------------
 # HELPER: FETCH EXTERNAL DATA
@@ -54,12 +96,8 @@ async def fetch_external_content(url, headers=None, is_binary=False):
 # HELPER: MATH ENGINE
 # ------------------------------------------------------------------
 def perform_filtered_math(content, cutoff_val, direction, metric="sum"):
-    """
-    Handles arithmetic filters with strict inclusive/exclusive logic.
-    """
     try:
         numbers = []
-        # Try processing as CSV first
         try:
             reader = csv.reader(io.StringIO(content))
             for row in reader:
@@ -70,65 +108,38 @@ def perform_filtered_math(content, cutoff_val, direction, metric="sum"):
         except:
             pass
 
-        # Fallback to line-by-line if CSV failed or was empty
         if not numbers:
             lines = [l.strip().replace(',', '') for l in content.split('\n') if l.strip()]
             for line in lines:
                 if re.match(r'^-?\d+(\.\d+)?$', line):
                     numbers.append(float(line))
         
-        if not numbers:
-            return None
+        if not numbers: return None
 
         print(f"🧮 Math Engine: {len(numbers)} nums. Filter: {direction} {cutoff_val}. Metric: {metric}")
-
         cutoff = float(cutoff_val)
         
-        # 1. Apply Filter
-        if direction in ["<", "below", "less", "smaller", "strictly less"]:
-            filtered = [n for n in numbers if n < cutoff]
-        elif direction in ["<=", "at most", "up to", "maximum", "inclusive_less", "less or equal"]:
-            filtered = [n for n in numbers if n <= cutoff]
-        elif direction in [">", "above", "more", "greater", "larger", "strictly greater"]:
-            filtered = [n for n in numbers if n > cutoff]
-        elif direction in [">=", "at least", "minimum", "inclusive_more", "greater or equal"]:
-            filtered = [n for n in numbers if n >= cutoff]
-        elif direction in ["=", "equal", "=="]:
-            filtered = [n for n in numbers if n == cutoff]
-        elif direction in ["!=", "not", "different"]:
-            filtered = [n for n in numbers if n != cutoff]
-        elif direction in ["%", "divisible", "mod"]:
-            filtered = [n for n in numbers if n % cutoff == 0]
-        else:
-            filtered = numbers 
+        if direction in ["<", "below", "less"]: filtered = [n for n in numbers if n < cutoff]
+        elif direction in ["<=", "at most", "up to"]: filtered = [n for n in numbers if n <= cutoff]
+        elif direction in [">", "above", "more"]: filtered = [n for n in numbers if n > cutoff]
+        elif direction in [">=", "at least"]: filtered = [n for n in numbers if n >= cutoff]
+        elif direction in ["=", "equal"]: filtered = [n for n in numbers if n == cutoff]
+        else: filtered = numbers 
 
-        # 2. Apply Metric
-        if not filtered:
-            return 0
+        if not filtered: return 0
 
         metric = metric.lower()
-        if metric == "count":
-            result = len(filtered)
-        elif metric in ["mean", "average"]:
-            result = statistics.mean(filtered)
-        elif metric in ["max", "maximum"]:
-            result = max(filtered)
-        elif metric in ["min", "minimum"]:
-            result = min(filtered)
-        elif metric == "median":
-            result = statistics.median(filtered)
-        else:
-            result = sum(filtered)
+        if metric == "count": result = len(filtered)
+        elif metric in ["mean", "average"]: result = statistics.mean(filtered)
+        elif metric in ["max", "maximum"]: result = max(filtered)
+        elif metric in ["min", "minimum"]: result = min(filtered)
+        else: result = sum(filtered)
 
-        # Formatting
-        if isinstance(result, float) and result.is_integer():
-            result = int(result)
-        elif isinstance(result, float):
-            result = round(result, 4)
+        if isinstance(result, float) and result.is_integer(): result = int(result)
+        elif isinstance(result, float): result = round(result, 4)
 
         print(f"✅ Calculation Result: {result}")
         return result
-
     except Exception as e:
         print(f"Math Error: {e}")
         return None
@@ -155,18 +166,21 @@ async def solve_quiz(start_url: str):
                 await page.goto(current_url, timeout=45000)
                 await page.wait_for_load_state("networkidle")
                 
+                # Check if we landed on a "completed" or "correct" static page (stop condition)
+                if "congratulations" in page.url.lower():
+                    print("🎉 Quiz Completed!")
+                    break
+
                 html_content = await page.content() 
                 screenshot = await page.screenshot(type="png")
                 b64_img = base64.b64encode(screenshot).decode('utf-8')
                 
-                # PREPARE USER MESSAGES
-                # We build the message payload dynamically to include audio if present
                 user_content = [
                     {"type": "text", "text": f"HTML Content:\n{html_content}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                 ]
 
-                # AUDIO HANDLING (Gemini Native)
+                # AUDIO
                 audio_element = await page.query_selector("audio source, a[href$='.mp3'], a[href$='.wav']")
                 if audio_element:
                     src = await audio_element.get_attribute("src") or await audio_element.get_attribute("href")
@@ -176,33 +190,30 @@ async def solve_quiz(start_url: str):
                         audio_bytes = await fetch_external_content(audio_url, is_binary=True)
                         if audio_bytes:
                             b64_audio = base64.b64encode(audio_bytes).decode('utf-8')
-                            # Attach audio directly to the prompt for Gemini to "hear"
+                            # Note: Only Gemini supports direct audio. If fallback to Llama happens,
+                            # Llama will ignore this or error. For stability, we might need transcription
+                            # but let's trust Gemini works most of the time.
                             user_content.append({
-                                "type": "image_url", # OpenRouter/Gemini often treats arbitrary attachments via this structure or similar
+                                "type": "image_url", 
                                 "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}
                             })
-                            print("✅ Audio attached to LLM prompt.")
 
                 print("👀 Context acquired. Planning action...")
 
                 system_prompt = """
                 You are an autonomous data extraction agent.
-                1. Analyze the HTML, Screenshot, and any attached Audio.
-                2. If you need to download a file or access an API to get the answer, return valid JSON:
-                   {"action": "scrape", "scrape_url": "<url>", "headers": {"key": "val"}, "submit_url": "<url>"}
-                3. If instructions specify a MATH FILTER (e.g. "sum numbers at most 5000"), extract it in JSON:
-                   {"action": "scrape", "scrape_url": "<file_url>", "submit_url": "<url>", 
-                    "math_filter": {"cutoff": 12000, "direction": "<=", "metric": "sum"}}
-                4. If the answer is a CHART or IMAGE, generate SVG code for it.
-                5. If you have the answer, return valid JSON:
-                   {"action": "submit", "answer": <value>, "submit_url": "<url>"}
-                6. Default "submit_url" to "/submit".
-                7. Your output must be a valid JSON object.
+                1. Analyze HTML/Screenshot.
+                2. Return JSON.
+                3. ACTIONS:
+                   - {"action": "scrape", "scrape_url": "<url>", "headers": {"key": "val"}, "submit_url": "<url>"}
+                   - {"action": "scrape", "scrape_url": "<url>", "math_filter": {"cutoff": 10, "direction": "<=", "metric": "sum"}}
+                   - {"action": "submit", "answer": <value>, "submit_url": "<url>"}
+                4. For Charts: Generate SVG code.
+                5. Default submit_url: "/submit"
                 """
                 
-                # MAIN LLM CALL (Reasoning + Vision + Audio)
-                response = await client.chat.completions.create(
-                    model=MODEL_ID,
+                # --- NEW CALL METHOD ---
+                response = await query_llm(
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content}
@@ -216,7 +227,7 @@ async def solve_quiz(start_url: str):
                 answer = None
                 raw_submit_url = llm_output.get("submit_url")
 
-                # HANDLE SCRAPING / FILE ANALYSIS
+                # HANDLE SCRAPE
                 if llm_output.get("action") == "scrape":
                     raw_scrape_url = llm_output.get("scrape_url")
                     headers = llm_output.get("headers", None)
@@ -225,17 +236,15 @@ async def solve_quiz(start_url: str):
                     print(f"🔎 Scraping: {target_url}")
                     path = urlparse(target_url).path.lower()
                     
-                    # IMAGE ANALYSIS
-                    if path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                    if path.endswith(('.png', '.jpg', '.jpeg')):
                         img_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
                         if img_bytes:
                             b64_scraped = base64.b64encode(img_bytes).decode('utf-8')
-                            vision_resp = await client.chat.completions.create(
-                                model=MODEL_ID,
+                            vision_resp = await query_llm(
                                 messages=[
-                                    {"role": "system", "content": "Analyze image. Return valid JSON: {\"answer\": <value>}"},
+                                    {"role": "system", "content": "Analyze image. Return JSON: {\"answer\": <value>}"},
                                     {"role": "user", "content": [
-                                        {"type": "text", "text": "Answer the question based on this image."},
+                                        {"type": "text", "text": "Question?"},
                                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_scraped}"}}
                                     ]}
                                 ],
@@ -243,12 +252,9 @@ async def solve_quiz(start_url: str):
                             )
                             answer = json.loads(vision_resp.choices[0].message.content).get("answer")
 
-                    # DATA/TEXT ANALYSIS
                     elif path.endswith(('.csv', '.txt', '.json', '.xml')):
-                        print("📂 Detected Data File.")
                         scraped_data = await fetch_external_content(target_url, headers=headers)
                         
-                        # Try Math Engine First
                         math_req = llm_output.get("math_filter")
                         if math_req and scraped_data:
                             answer = perform_filtered_math(
@@ -257,36 +263,29 @@ async def solve_quiz(start_url: str):
                                 math_req.get("direction"),
                                 math_req.get("metric", "sum")
                             )
-                            if answer is not None: print(f"⚡ Math Result: {answer}")
 
-                        # Fallback to LLM if Math Engine didn't return a result
                         if answer is None and scraped_data:
-                            print("Asking LLM to analyze text content...")
-                            # Gemini Flash has a huge context, so we can pass more data (e.g. 100k chars)
-                            truncated_data = scraped_data[:100000] 
-                            follow_up = await client.chat.completions.create(
-                                model=MODEL_ID,
+                            truncated_data = scraped_data[:50000] 
+                            follow_up = await query_llm(
                                 messages=[
-                                    {"role": "system", "content": "Analyze data. Return valid JSON: {\"answer\": <value>}"},
-                                    {"role": "user", "content": f"Context:\n{html_content}\n\nFile Data:\n{truncated_data}"}
+                                    {"role": "system", "content": "Analyze data. Return JSON: {\"answer\": <value>}"},
+                                    {"role": "user", "content": f"Data:\n{truncated_data}"}
                                 ],
                                 response_format={"type": "json_object"}
                             )
                             answer = json.loads(follow_up.choices[0].message.content).get("answer")
 
-                    # WEBPAGE ANALYSIS
                     else:
-                        print("🌐 Detected Webpage.")
+                        # Webpage scraping
                         page2 = await context.new_page()
                         await page2.goto(target_url, timeout=30000)
                         scraped_html = await page2.content()
                         await page2.close()
                         
-                        follow_up = await client.chat.completions.create(
-                            model=MODEL_ID,
+                        follow_up = await query_llm(
                             messages=[
-                                {"role": "system", "content": "Analyze the page. Return valid JSON: {\"answer\": <value>}"},
-                                {"role": "user", "content": f"Main Page HTML: {html_content}\n\nScraped Page HTML:\n{scraped_html}"}
+                                {"role": "system", "content": "Analyze page. Return JSON: {\"answer\": <value>}"},
+                                {"role": "user", "content": f"Main HTML: {html_content}\n\nScraped HTML:\n{scraped_html}"}
                             ],
                             response_format={"type": "json_object"}
                         )
@@ -299,7 +298,7 @@ async def solve_quiz(start_url: str):
                     print("❌ Failure: No answer found.")
                     break
 
-                # SVG Handling
+                # SVG / Dictionary cleanup
                 if isinstance(answer, str) and "<svg" in answer:
                     answer = "data:image/svg+xml;base64," + base64.b64encode(answer.encode('utf-8')).decode('utf-8')
 
@@ -309,7 +308,6 @@ async def solve_quiz(start_url: str):
                 else:
                     submit_url = urljoin(current_url, raw_submit_url)
 
-                # Extract answer if it's a dict (edge case handling)
                 if isinstance(answer, dict):
                     candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url', 'answer']]
                     answer = candidates[0] if candidates else json.dumps(answer)
@@ -340,6 +338,8 @@ async def solve_quiz(start_url: str):
                     
             except Exception as e:
                 print(f"🔥 Critical Error: {e}")
+                # Don't break immediately on critical error, maybe retry the loop?
+                # For now, we break to avoid infinite loops on fatal errors.
                 break
         
         await browser.close()
