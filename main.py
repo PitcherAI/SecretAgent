@@ -11,21 +11,26 @@ from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
-from openai import AsyncOpenAI, RateLimitError, APIError
+from openai import AsyncOpenAI
 
 app = FastAPI()
 
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-# We use a list of models. If the first fails (429), we try the next.
-# 1. Gemini 2.0 Flash (Fastest, Smartest)
-# 2. Llama 3.3 70B (Very Stable Free Tier)
+# 1. Grok 4.1 Fast (New Free Tier - Excellent Reasoning)
+# 2. Llama 3.3 70B (Reliable Generalist)
+# 3. DeepSeek V3 (High Performance Backup)
+# 4. Gemini 2.0 Flash (Experimental, use as last resort due to 429s)
 MODEL_PRIORITY = [
-    "google/gemini-2.0-flash-exp:free",
+    "x-ai/grok-4.1-fast:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-chat:free"
+    "deepseek/deepseek-chat:free",
+    "google/gemini-2.0-flash-exp:free"
 ]
+
+# Specialized model just for Vision tasks (Grok 4.1 Fast can be text-only)
+VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free"
 
 client = AsyncOpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
@@ -41,13 +46,16 @@ class QuizRequest(BaseModel):
     url: str
 
 # ------------------------------------------------------------------
-# HELPER: ROBUST LLM CALLER (Fixes 429 Errors)
+# HELPER: ROBUST LLM CALLER
 # ------------------------------------------------------------------
-async def query_llm(messages, response_format=None):
+async def query_llm(messages, response_format=None, force_model=None):
     """
     Tries models in order. If one is rate-limited, it waits or switches.
     """
-    for model in MODEL_PRIORITY:
+    # If a specific model is forced (e.g. for vision), use only that one
+    priority_list = [force_model] if force_model else MODEL_PRIORITY
+
+    for model in priority_list:
         retries = 3
         delay = 5
         
@@ -59,22 +67,21 @@ async def query_llm(messages, response_format=None):
                     messages=messages,
                     response_format=response_format
                 )
-                return response # Success!
+                return response 
                 
             except Exception as e:
                 error_msg = str(e).lower()
-                # Check for Rate Limits (429) or Overloaded server
                 if "429" in error_msg or "rate limit" in error_msg or "upstream" in error_msg:
                     print(f"⏳ Rate Limited on {model}. Waiting {delay}s...")
                     await asyncio.sleep(delay)
-                    delay *= 2 # Exponential backoff (5s -> 10s -> 20s)
+                    delay *= 2 
                 else:
                     print(f"⚠️ API Error on {model}: {e}")
-                    break # Fatal error for this model, try next one
+                    break 
         
         print(f"⏭️ Skipping {model}, trying next fallback...")
     
-    raise Exception("❌ All models failed or rate limited.")
+    raise Exception("❌ All models failed.")
 
 # ------------------------------------------------------------------
 # HELPER: FETCH EXTERNAL DATA
@@ -166,7 +173,6 @@ async def solve_quiz(start_url: str):
                 await page.goto(current_url, timeout=45000)
                 await page.wait_for_load_state("networkidle")
                 
-                # Check if we landed on a "completed" or "correct" static page (stop condition)
                 if "congratulations" in page.url.lower():
                     print("🎉 Quiz Completed!")
                     break
@@ -175,44 +181,26 @@ async def solve_quiz(start_url: str):
                 screenshot = await page.screenshot(type="png")
                 b64_img = base64.b64encode(screenshot).decode('utf-8')
                 
-                user_content = [
-                    {"type": "text", "text": f"HTML Content:\n{html_content}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
-                ]
-
-                # AUDIO
-                audio_element = await page.query_selector("audio source, a[href$='.mp3'], a[href$='.wav']")
-                if audio_element:
-                    src = await audio_element.get_attribute("src") or await audio_element.get_attribute("href")
-                    if src:
-                        audio_url = urljoin(current_url, src)
-                        print(f"🎤 Found Audio: {audio_url}")
-                        audio_bytes = await fetch_external_content(audio_url, is_binary=True)
-                        if audio_bytes:
-                            b64_audio = base64.b64encode(audio_bytes).decode('utf-8')
-                            # Note: Only Gemini supports direct audio. If fallback to Llama happens,
-                            # Llama will ignore this or error. For stability, we might need transcription
-                            # but let's trust Gemini works most of the time.
-                            user_content.append({
-                                "type": "image_url", 
-                                "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}
-                            })
-
-                print("👀 Context acquired. Planning action...")
-
+                # --- MAIN REASONING STEP (Using Grok 4.1) ---
+                # We separate text/image here. We send Text to Grok.
+                # If Grok needs to see the image, we rely on its vision capabilities 
+                # OR fallback to the specific vision model in the 'scrape' phase.
+                
                 system_prompt = """
-                You are an autonomous data extraction agent.
-                1. Analyze HTML/Screenshot.
-                2. Return JSON.
-                3. ACTIONS:
-                   - {"action": "scrape", "scrape_url": "<url>", "headers": {"key": "val"}, "submit_url": "<url>"}
-                   - {"action": "scrape", "scrape_url": "<url>", "math_filter": {"cutoff": 10, "direction": "<=", "metric": "sum"}}
-                   - {"action": "submit", "answer": <value>, "submit_url": "<url>"}
-                4. For Charts: Generate SVG code.
-                5. Default submit_url: "/submit"
+                You are an autonomous agent.
+                1. Analyze the HTML. 
+                2. If there is a question requiring visual analysis, return {"action": "visual_analyze"}.
+                3. If you need to download/scrape, return {"action": "scrape", "scrape_url": "...", "submit_url": "..."}.
+                4. If you have the answer, return {"action": "submit", "answer": <value>, "submit_url": "..."}.
+                5. If math is needed: {"action": "scrape", "scrape_url": "...", "math_filter": {"cutoff": 10, "direction": "<=", "metric": "sum"}}.
+                6. Default submit_url: "/submit".
                 """
                 
-                # --- NEW CALL METHOD ---
+                user_content = [{"type": "text", "text": f"HTML Content:\n{html_content}"}]
+
+                # Try attaching image to Grok, but be prepared for it to ignore it if text-only
+                # user_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}})
+
                 response = await query_llm(
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -227,8 +215,24 @@ async def solve_quiz(start_url: str):
                 answer = None
                 raw_submit_url = llm_output.get("submit_url")
 
+                # SPECIAL VISUAL CHECK (If Grok says "I need to see the image")
+                if llm_output.get("action") == "visual_analyze":
+                    print("🖼️ Grok requested visual analysis. Switching to Vision Model...")
+                    vision_resp = await query_llm(
+                        messages=[
+                            {"role": "system", "content": "Analyze image. Return JSON: {\"answer\": <value>}"},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": "What is the answer based on this screenshot?"},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
+                            ]}
+                        ],
+                        response_format={"type": "json_object"},
+                        force_model=VISION_MODEL 
+                    )
+                    answer = json.loads(vision_resp.choices[0].message.content).get("answer")
+
                 # HANDLE SCRAPE
-                if llm_output.get("action") == "scrape":
+                elif llm_output.get("action") == "scrape":
                     raw_scrape_url = llm_output.get("scrape_url")
                     headers = llm_output.get("headers", None)
                     target_url = urljoin(current_url, raw_scrape_url)
@@ -240,6 +244,7 @@ async def solve_quiz(start_url: str):
                         img_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
                         if img_bytes:
                             b64_scraped = base64.b64encode(img_bytes).decode('utf-8')
+                            # Force Vision Model for Scraped Images
                             vision_resp = await query_llm(
                                 messages=[
                                     {"role": "system", "content": "Analyze image. Return JSON: {\"answer\": <value>}"},
@@ -248,7 +253,8 @@ async def solve_quiz(start_url: str):
                                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_scraped}"}}
                                     ]}
                                 ],
-                                response_format={"type": "json_object"}
+                                response_format={"type": "json_object"},
+                                force_model=VISION_MODEL
                             )
                             answer = json.loads(vision_resp.choices[0].message.content).get("answer")
 
@@ -276,7 +282,6 @@ async def solve_quiz(start_url: str):
                             answer = json.loads(follow_up.choices[0].message.content).get("answer")
 
                     else:
-                        # Webpage scraping
                         page2 = await context.new_page()
                         await page2.goto(target_url, timeout=30000)
                         scraped_html = await page2.content()
@@ -294,19 +299,34 @@ async def solve_quiz(start_url: str):
                 else:
                     answer = llm_output.get("answer")
 
-                if answer is None or not raw_submit_url:
-                    print("❌ Failure: No answer found.")
-                    break
+                if answer is None:
+                    # Fallback: If Grok couldn't decide, maybe it missed visual context.
+                    # Try one last hail mary with vision model on the screenshot
+                    print("⚠️ No answer from text analysis. Trying Visual Analysis fallback...")
+                    vision_resp = await query_llm(
+                        messages=[
+                            {"role": "system", "content": "Return JSON: {\"answer\": <value>}"},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": "What is the answer to the question on this screen?"},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
+                            ]}
+                        ],
+                        response_format={"type": "json_object"},
+                        force_model=VISION_MODEL
+                    )
+                    answer = json.loads(vision_resp.choices[0].message.content).get("answer")
 
-                # SVG / Dictionary cleanup
                 if isinstance(answer, str) and "<svg" in answer:
                     answer = "data:image/svg+xml;base64," + base64.b64encode(answer.encode('utf-8')).decode('utf-8')
 
-                parsed_sub = urlparse(raw_submit_url)
-                if not parsed_sub.path or parsed_sub.path == "/":
-                    submit_url = urljoin(current_url, "/submit")
+                if raw_submit_url:
+                     parsed_sub = urlparse(raw_submit_url)
+                     if not parsed_sub.path or parsed_sub.path == "/":
+                         submit_url = urljoin(current_url, "/submit")
+                     else:
+                         submit_url = urljoin(current_url, raw_submit_url)
                 else:
-                    submit_url = urljoin(current_url, raw_submit_url)
+                    submit_url = urljoin(current_url, "/submit")
 
                 if isinstance(answer, dict):
                     candidates = [v for k, v in answer.items() if k not in ['email', 'secret', 'url', 'answer']]
@@ -338,8 +358,6 @@ async def solve_quiz(start_url: str):
                     
             except Exception as e:
                 print(f"🔥 Critical Error: {e}")
-                # Don't break immediately on critical error, maybe retry the loop?
-                # For now, we break to avoid infinite loops on fatal errors.
                 break
         
         await browser.close()
