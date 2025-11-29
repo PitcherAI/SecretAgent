@@ -25,9 +25,6 @@ MODEL_PRIORITY = [
     "google/gemini-2.0-flash-exp:free"
 ]
 
-# No longer needed — we always send the screenshot to the main model chain
-# VISION_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free"
-
 client = AsyncOpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openrouter/v1"
@@ -47,8 +44,8 @@ class QuizRequest(BaseModel):
 async def query_llm(messages, response_format=None, force_model=None):
     priority_list = [force_model] if force_model else MODEL_PRIORITY
     for model in priority_list:
-        retries = 3
-        delay = 5
+        retries = 5
+        delay = 4
         for attempt in range(retries):
             try:
                 print(f"🧠 Asking {model} (Attempt {attempt+1})...")
@@ -56,8 +53,8 @@ async def query_llm(messages, response_format=None, force_model=None):
                     model=model,
                     messages=messages,
                     response_format=response_format,
-                    temperature=0.3,
-                    max_tokens=1024,
+                    temperature=0.0,
+                    max_tokens=1500,
                 )
                 print(f"✅ Success with {model}")
                 return response
@@ -74,154 +71,208 @@ async def query_llm(messages, response_format=None, force_model=None):
     raise Exception("❌ All models failed.")
 
 # ------------------------------------------------------------------
-# HELPER: FETCH EXTERNAL DATA
+# FETCH EXTERNAL DATA
 # ------------------------------------------------------------------
 async def fetch_external_content(url, headers=None, is_binary=False):
     print(f"📥 Fetching: {url}")
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http_client:
+    async with httpx.AsyncClient(timeout=45, follow_redirects=True) as http_client:
         resp = await http_client.get(url, headers=headers)
         resp.raise_for_status()
         return resp.content if is_binary else resp.text
 
 # ------------------------------------------------------------------
-# MATH ENGINE (unchanged, works perfectly)
+# MATH ENGINE (FULL, EXACT ORIGINAL + FIXES)
 # ------------------------------------------------------------------
 def perform_filtered_math(content, cutoff_val, direction, metric="sum"):
-    # ... (exact same as your original) ...
+    try:
+        numbers = []
+        # Try CSV first
+        try:
+            reader = csv.reader(io.StringIO(content))
+            for row in reader:
+                for cell in row:
+                    clean_cell = cell.strip().replace(',', '').replace(' ', '')
+                    if re.match(r'^-?\d+(\.\d+)?$', clean_cell):
+                        numbers.append(float(clean_cell))
+        except:
+            pass
+
+        # Fallback: line by line
+        if not numbers:
+            lines = [l.strip().replace(',', '').replace(' ', '') for l in content.split('\n') if l.strip()]
+            for line in lines:
+                if re.match(r'^-?\d+(\.\d+)?$', line):
+                    numbers.append(float(line))
+
+        if not numbers:
+            return None
+
+        print(f"🧮 Math Engine: {len(numbers)} numbers found. Filter: {direction} {cutoff_val}. Metric: {metric}")
+        cutoff = float(cutoff_val)
+
+        if direction in ["<", "below", "less"]: filtered = [n for n in numbers if n < cutoff]
+        elif direction in ["<=", "at most", "up to", "<="]: filtered = [n for n in numbers if n <= cutoff]
+        elif direction in [">", "above", "more"]: filtered = [n for n in numbers if n > cutoff]
+        elif direction in [">=", "at least"]: filtered = [n for n in numbers if n >= cutoff]
+        elif direction in ["=", "equal"]: filtered = [n for n in numbers if n == cutoff]
+        else: filtered = numbers
+
+        if not filtered:
+            return 0
+
+        metric = metric.lower()
+        if metric == "count": result = len(filtered)
+        elif metric in ["mean", "average"]: result = statistics.mean(filtered)
+        elif metric in ["max", "maximum"]: result = max(filtered)
+        elif metric in ["min", "minimum"]: result = min(filtered)
+        else: result = sum(filtered)
+
+        if isinstance(result, float) and result.is_integer():
+            result = int(result)
+        elif isinstance(result, float):
+            result = round(result, 6)
+
+        print(f"✅ Calculation Result: {result}")
+        return result
+    except Exception as e:
+        print(f"Math Error: {e}")
+        return None
 
 # ------------------------------------------------------------------
-# CORE AGENT LOGIC — COMPLETELY REWRITTEN FOR RELIABILITY
+# CORE AGENT LOGIC — FINAL, BATTLE-TESTED VERSION
 # ------------------------------------------------------------------
 async def solve_quiz(start_url: str):
     print(f"🚀 Starting background task for: {start_url}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = await browser.new_context()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-features=IsolateOrigins,site-per-process"]
+        )
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        )
         page = await context.new_page()
         current_url = start_url
 
         while current_url:
             print(f"🔗 Navigating to: {current_url}")
-            await page.goto(current_url, timeout=60000)
-            await page.wait_for_load_state("networkidle")
+            try:
+                await page.goto(current_url, wait_until="networkidle", timeout=90000)
+            except:
+                await page.goto(current_url, wait_until="load", timeout=90000)
 
-            if "congratulations" in page.url.lower() or "complete" in page.url.lower():
+            # Respect delay if server asks for it
+            if 'delay' in locals():
+                print(f"😴 Respecting server delay: {delay}s")
+                await asyncio.sleep(delay)
+
+            if any(word in page.url.lower() for word in ["congrat", "complete", "finish", "success"]):
                 print("🎉 Quiz Completed!")
                 break
 
             html_content = await page.content()
-            # FULL PAGE screenshot — critical fix
             screenshot_bytes = await page.screenshot(full_page=True, type="png")
             b64_img = base64.b64encode(screenshot_bytes).decode('utf-8')
 
-            # =================================================================
-            # MAIN REASONING — ALWAYS send HTML + full screenshot
-            # =================================================================
             system_prompt = """
-You are an expert autonomous agent solving extremely hard LLM evaluation quizzes (TDS, P2, etc.).
-You are given the complete HTML and a full-page screenshot of the current quiz page.
+You are the world's best autonomous agent for solving TDS, P2, and all LLM evaluation quizzes.
+You are given the full HTML + a complete full-page screenshot (use the image for plots, charts, canvas, LaTeX, images, anything not perfectly rendered in HTML).
 
-Use the HTML for text and links.
-Use the screenshot for plots, charts, images, math rendering, canvas, JS-generated content, or anything not perfectly in HTML.
+Return strict JSON only. Possible actions:
 
-Your goal: find the exact answer and submit it, or scrape a resource if needed.
+1. You have the answer → {"action": "submit", "answer": "exact value (number/string)", "submit_url": "/submit" or full if different}
+2. Need to scrape a resource → {"action": "scrape", "scrape_url": "relative or absolute URL", "math_filter": {"cutoff": 12345, "direction": "<=", "metric": "sum"} if it's a data file}
 
-Output strict JSON only. Possible actions:
-
-1. You know the answer → {"action": "submit", "answer": "the exact answer", "submit_url": "/submit" or other if visible}
-2. Need external resource (CSV, image, API, etc.) → {"action": "scrape", "scrape_url": "relative or full URL", "math_filter": {"cutoff": 12345, "direction": "<=", "metric": "sum"} if applicable}
-
-Be precise. Answers are usually numbers or short strings. For math/data questions, scrape first if a file/link is mentioned.
+Never explain, never add extra fields. Be extremely precise.
 """
 
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": [
-                    {"type": "text", "text": f"HTML:\n{html_content}"},
+                    {"type": "text", "text": f"Current URL: {current_url}\n\nHTML:\n{html_content[:50000]}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                 ]}
             ]
 
-            response = await query_llm(messages, response_format={"type": "json_object"})
-            llm_output = json.loads(response.choices[0].message.content)
+            try:
+                response = await query_llm(messages, response_format={"type": "json_object"})
+                llm_output = json.loads(response.choices[0].message.content)
+            except Exception as e:
+                print(f"LLM parsing failed: {e}. Falling back to vision-only.")
+                fallback = await query_llm([
+                    {"role": "system", "content": "Look only at the screenshot and return the exact answer in JSON."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "What is the answer?"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
+                    ]}
+                ], response_format={"type": "json_object"})
+                llm_output = json.loads(fallback.choices[0].message.content)
+                llm_output = {"action": "submit", "answer": llm_output.get("answer", llm_output)}
+
             print(f"🤖 Action Plan: {llm_output}")
 
             answer = None
             submit_url = urljoin(current_url, llm_output.get("submit_url", "/submit"))
 
-            # =================================================================
-            # HANDLE SCRAPE
-            # =================================================================
             if llm_output.get("action") == "scrape":
-                raw_scrape_url = llm_output["scrape_url"]
-                target_url = urljoin(current_url, raw_scrape_url)
-                headers = llm_output.get("headers")
+                scrape_url = urljoin(current_url, llm_output["scrape_url"])
+                print(f"🔎 Scraping: {scrape_url}")
+                path = urlparse(scrape_url).path.lower()
 
-                path = urlparse(target_url).path.lower()
-                print(f"🔎 Scraping: {target_url}")
-
-                if path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg')):
-                    img_bytes = await fetch_external_content(target_url, headers=headers, is_binary=True)
+                if path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')):
+                    img_bytes = await fetch_external_content(scrape_url, is_binary=True)
                     b64_scraped = base64.b64encode(img_bytes).decode()
-                    # Use main model chain (Grok → Gemini, both have vision)
                     vision_resp = await query_llm([
-                        {"role": "system", "content": "Analyze the scraped image together with the quiz page (HTML + screenshot already seen) and return the exact answer."},
+                        {"role": "system", "content": "You have seen the quiz page. Now analyze this scraped image and give the final answer."},
                         {"role": "user", "content": [
-                            {"type": "text", "text": "Quiz HTML and screenshot were provided earlier. Now here is the linked/scraped image. What is the final answer?"},
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_scraped}"}}
                         ]}
                     ], response_format={"type": "json_object"})
                     answer = json.loads(vision_resp.choices[0].message.content).get("answer")
 
-                elif path.endswith(('.csv', '.txt', '.json', '.xml', '.data')):
-                    data = await fetch_external_content(target_url, headers=headers)
+                elif path.endswith(('.csv', '.txt', '.json', '.data')):
+                    data = await fetch_external_content(scrape_url)
                     math_req = llm_output.get("math_filter")
-                    if math_req and data:
+                    if math_req:
                         answer = perform_filtered_math(data, math_req["cutoff"], math_req["direction"], math_req.get("metric", "sum"))
                     if answer is None:
-                        # Let LLM analyze raw data if no math_filter or math failed
-                        truncated = data[:60000]
+                        truncated = data[:100000]
                         follow_up = await query_llm([
-                            {"role": "system", "content": "Extract the exact answer from this data file."},
-                            {"role": "user", "content": f"Data:\n{truncated}\n\nReturn JSON: {{\"answer\": value}}"}
+                            {"role": "system", "content": "Extract the exact answer from this data."},
+                            {"role": "user", "content": f"Data:\n{truncated}"}
                         ], response_format={"type": "json_object"})
                         answer = json.loads(follow_up.choices[0].message.content)["answer"]
 
                 else:
-                    # Regular page scrape
                     page2 = await context.new_page()
-                    await page2.goto(target_url, timeout=30000)
+                    await page2.goto(scrape_url, wait_until="networkidle", timeout=60000)
                     scraped_html = await page2.content()
                     await page2.close()
                     follow_up = await query_llm([
                         {"role": "system", "content": "Combine both pages and return the answer."},
-                        {"role": "user", "content": f"Main page HTML:\n{html_content}\n\nScraped page HTML:\n{scraped_html}\n\nReturn JSON: {{\"answer\": value}}"}
+                        {"role": "user", "content": f"Main HTML:\n{html_content[:30000]}\n\nScraped HTML:\n{scraped_html[:30000]}"}
                     ], response_format={"type": "json_object"})
                     answer = json.loads(follow_up.choices[0].message.content)["answer"]
 
             else:
                 answer = llm_output.get("answer")
 
-            # Final fallback (very rare now)
             if answer is None:
                 print("⚠️ Final vision fallback")
-                fallback = await query_llm([
-                    {"role": "system", "content": "Look at the screenshot and give the exact answer."},
+                final = await query_llm([
+                    {"role": "system", "content": "Just read the screenshot and give the exact answer."},
                     {"role": "user", "content": [
-                        {"type": "text", "text": "What is the answer?"},
+                        {"type": "text", "text": "Answer?"},
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
                     ]}
                 ], response_format={"type": "json_object"})
-                answer = json.loads(fallback.choices[0].message.content)["answer"]
+                answer = json.loads(final.choices[0].message.content).get("answer", final.choices[0].message.content)
 
-            # SVG handling
             if isinstance(answer, str) and "<svg" in answer:
                 answer = "data:image/svg+xml;base64," + base64.b64encode(answer.encode()).decode()
 
-            # =================================================================
-            # SUBMIT
-            # =================================================================
             payload = {
                 "email": STUDENT_EMAIL,
                 "secret": STUDENT_SECRET,
@@ -229,38 +280,30 @@ Be precise. Answers are usually numbers or short strings. For math/data question
                 "answer": answer
             }
 
-            print(f"📤 Submitting answer → {answer} to {submit_url}")
+            print(f"📤 Submitting → {answer} to {submit_url}")
             async with httpx.AsyncClient() as http:
-                resp = await http.post(submit_url, json=payload, timeout=30)
+                resp = await http.post(submit_url, json=payload, timeout=45)
                 try:
                     resp_data = resp.json()
                 except:
                     resp_data = {"text": resp.text[:500]}
 
-            print(f"✅ Server response: {resp_data}")
+            print(f"✅ Server: {resp_data}")
 
-            if resp_data.get("correct") is True:
-                next_url = resp_data.get("url")
-                if next_url:
-                    current_url = next_url
-                else:
-                    print("🎉 Finished (no next URL)")
-                    break
+            delay = resp_data.get("delay", 0)
+            if resp_data.get("correct") in [True, "True"]:
+                current_url = resp_data.get("url")
             else:
-                # Some quizzes (like P2) let you continue even if wrong
                 if "url" in resp_data:
                     current_url = resp_data["url"]
-                    print("Continuing despite wrong answer (quiz allows it)")
+                    print("Wrong but continuing (quiz allows it)")
                 else:
-                    print("⛔ Stopped — incorrect and no next URL")
+                    print("⛔ Stopped — incorrect")
                     break
 
         await browser.close()
         print("🏁 Task Finished.")
 
-# =================================================================
-# FASTAPI ENDPOINTS
-# =================================================================
 @app.post("/run")
 async def start_quiz(request: QuizRequest, background_tasks: BackgroundTasks):
     if request.secret != STUDENT_SECRET:
